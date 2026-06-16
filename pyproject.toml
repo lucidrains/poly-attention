@@ -1,6 +1,6 @@
 [project]
 name = "poly-attention"
-version = "0.0.1"
+version = "0.0.2"
 description = "PolyAttention"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -26,12 +26,11 @@ dependencies = [
     "einx>=0.3.0",
     "einops>=0.8.1",
     "torch>=2.5",
-    "x-transformers>=2.21.4",
 ]
 
 [project.urls]
 Homepage = "https://pypi.org/project/poly-attention/"
-Repository = "https://github.com/lucidrains/poly-attention"
+Repository = "https://codeberg.org/lucidrains/poly-attention"
 
 [project.optional-dependencies]
 examples = []
