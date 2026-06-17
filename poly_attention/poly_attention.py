@@ -40,6 +40,7 @@ class Order2PolyAttention(Module):
         kv_heads = None,
         dim_head = 64,
         causal = False,
+        shared_kv = False,
         softclamp_value = 20.,
         eps = 1e-9
     ):
@@ -57,6 +58,7 @@ class Order2PolyAttention(Module):
         dim_inner_kv = dim_head * kv_heads
 
         self.causal = causal
+        self.shared_kv = shared_kv
         self.softclamp_value = softclamp_value
 
         self.split_heads = Rearrange('b n (h d) -> b h n d', d = dim_head)
@@ -68,7 +70,9 @@ class Order2PolyAttention(Module):
             self.num_rep = heads // kv_heads
 
         self.to_q_gates = LinearNoBias(dim, dim_inner * 2)
-        self.to_kv = LinearNoBias(dim, dim_inner_kv * 4)
+
+        kv_mult = 2 if shared_kv else 4
+        self.to_kv = LinearNoBias(dim, dim_inner_kv * kv_mult)
 
         self.q1_norm = RMSNorm(dim_head)
         self.q2_norm = RMSNorm(dim_head)
@@ -84,7 +88,13 @@ class Order2PolyAttention(Module):
         if has_cache:
             assert seq_len == 1, 'sequence length must be 1 when using kv cache'
 
-        q1, gates, q2, q3, v2, v3 = [self.split_heads(t) for t in (*self.to_q_gates(x).chunk(2, dim = -1), *self.to_kv(x).chunk(4, dim = -1))]
+        q1, gates = [self.split_heads(t) for t in self.to_q_gates(x).chunk(2, dim = -1)]
+
+        if self.shared_kv:
+            q2, q3 = [self.split_heads(t) for t in self.to_kv(x).chunk(2, dim = -1)]
+            v2, v3 = q2, q3
+        else:
+            q2, q3, v2, v3 = [self.split_heads(t) for t in self.to_kv(x).chunk(4, dim = -1)]
 
         q1 = self.q1_norm(q1)
         q2 = self.q2_norm(q2)

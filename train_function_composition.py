@@ -71,12 +71,12 @@ def function_composition(
 # models
 
 class Block(Module):
-    def __init__(self, dim, heads = 8, dim_head = 64, use_poly = False, order = 2):
+    def __init__(self, dim, heads = 8, dim_head = 64, use_poly = False, order = 2, shared_kv = False):
         super().__init__()
 
         if use_poly:
             if order == 2:
-                self.attn = PolyAttention(dim, heads = heads, dim_head = dim_head)
+                self.attn = PolyAttention(dim, heads = heads, dim_head = dim_head, shared_kv = shared_kv)
             else:
                 self.attn = NPolyAttention(dim, order = order, heads = heads, dim_head = dim_head)
         else:
@@ -102,14 +102,15 @@ class Model(Module):
         dim_head = 32,
         layers = 6,
         use_poly = False,
-        order = 2
+        order = 2,
+        shared_kv = False
     ):
         super().__init__()
         self.embedding = nn.Linear(vocab_size, dim)
         self.pos_enc = nn.Embedding(seq_len, dim)
 
         self.blocks = ModuleList([
-            Block(dim, heads = heads, dim_head = dim_head, use_poly = use_poly, order = order)
+            Block(dim, heads = heads, dim_head = dim_head, use_poly = use_poly, order = order, shared_kv = shared_kv)
             for _ in range(layers)
         ])
 
@@ -140,7 +141,8 @@ def train_model(
     num_classes: int = 10,
     composition_depth: int = 2,
     seed: int = 42,
-    order: int = 2
+    order: int = 2,
+    shared_kv: bool = False
 ):
     torch.manual_seed(seed)
 
@@ -173,7 +175,8 @@ def train_model(
         dim_head = dim_head,
         layers = layers,
         use_poly = use_poly,
-        order = order
+        order = order,
+        shared_kv = shared_kv
     )
 
     optimizer = Adam(model.parameters(), lr = lr)
@@ -245,7 +248,8 @@ def main(
     num_classes: int = 10,
     composition_depth: int = 2,
     seed: int = 42,
-    order: int = 2
+    order: int = 2,
+    shared_kv: bool = False
 ):
     accelerator = Accelerator()
 
@@ -267,7 +271,7 @@ def main(
         order = order
     )
 
-    acc_poly = train_fn("PolyAttention", use_poly = True)
+    acc_poly = train_fn("PolyAttention", use_poly = True, shared_kv = shared_kv)
     acc_base = train_fn("BaseSelfAttention", use_poly = False)
 
     accelerator.print(f"Final Best Accuracies ({layers} Layers, Order {order}) -> Base: {acc_base:.4f} | Poly: {acc_poly:.4f}")

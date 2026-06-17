@@ -41,3 +41,15 @@ out = attn(tokens) # (1, 1024, 512)
     year    = {2026}
 }
 ```
+
+```bibtex
+@misc{kayyam2026transformersneedprojectionssystematic,
+    title   = {Do Transformers Need Three Projections? Systematic Study of QKV Variants},
+    author  = {Ali Kayyam and Anusha Madan Gopal and M Anthony Lewis},
+    year    = {2026},
+    eprint  = {2606.04032},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2606.04032},
+}
+```
