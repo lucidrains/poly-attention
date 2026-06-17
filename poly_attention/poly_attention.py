@@ -107,8 +107,6 @@ class Order2PolyAttention(Module):
         q_left = stack((q1, q2))
         q_right = stack((q2_full, q3_full))
 
-        # unscaled exp values
-
         scores = einsum('... i d, ... j d -> ... i j', q_left, q_right) * self.scale
         scores = softclamp(scores, self.softclamp_value)
 

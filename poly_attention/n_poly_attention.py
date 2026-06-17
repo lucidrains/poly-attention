@@ -103,7 +103,7 @@ class NPolyAttention(Module):
         q_left = stack(qs[:-1])
         q_right = stack(qs[1:])
 
-        # unscaled values
+        # scores
 
         scores = einsum('... i d, ... j d -> ... i j', q_left, q_right) * self.scale
         scores = softclamp(scores, self.softclamp_value)
