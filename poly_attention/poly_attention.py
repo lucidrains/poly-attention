@@ -3,13 +3,14 @@
 from functools import partial
 
 import torch
-from torch import nn, einsum, stack
+from torch import nn, einsum, stack, cat
 from torch.nn import Module, RMSNorm
 import torch.nn.functional as F
 
 import einx
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
+from rotary_embedding_torch import apply_rotary_emb
 
 # constants
 
@@ -31,7 +32,7 @@ def softclamp(x, c):
 
 # poly attention
 
-class PolyAttention(Module):
+class Order2PolyAttention(Module):
     def __init__(
         self,
         dim,
@@ -58,8 +59,7 @@ class PolyAttention(Module):
         self.causal = causal
         self.softclamp_value = softclamp_value
 
-        self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
-        self.split_kv_heads = Rearrange('b n (h d) -> b h n d', h = kv_heads)
+        self.split_heads = Rearrange('b n (h d) -> b h n d', d = dim_head)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
         self.is_gqa = heads != kv_heads
@@ -76,68 +76,80 @@ class PolyAttention(Module):
 
         self.to_out = nn.Linear(dim_inner, dim)
 
-        self._reset_parameters()
+    def forward(self, x, mask = None, rotary_pos_emb = None, cache = None, return_cache = False):
+        seq_len, device = x.shape[-2], x.device
 
-    def _reset_parameters(self):
-        # small initialization is crucial to prevent exp() overflow
-        nn.init.normal_(self.to_q_gates.weight, mean = 0.0, std = 0.01)
-        nn.init.normal_(self.to_kv.weight, mean = 0.0, std = 0.01)
-        nn.init.normal_(self.to_out.weight, mean = 0.0, std = 0.01)
-        nn.init.zeros_(self.to_out.bias)
+        has_cache = exists(cache)
 
-    def forward(self, x, mask = None):
-        device = x.device
+        if has_cache:
+            assert seq_len == 1, 'sequence length must be 1 when using kv cache'
 
-        q1, gates = map(self.split_heads, self.to_q_gates(x).chunk(2, dim = -1))
-        q2, q3, v2, v3 = map(self.split_kv_heads, self.to_kv(x).chunk(4, dim = -1))
+        q1, gates, q2, q3, v2, v3 = [self.split_heads(t) for t in (*self.to_q_gates(x).chunk(2, dim = -1), *self.to_kv(x).chunk(4, dim = -1))]
 
         q1 = self.q1_norm(q1)
         q2 = self.q2_norm(q2)
         q3 = self.q3_norm(q3)
 
+        if exists(rotary_pos_emb):
+            q1, q2, q3 = [apply_rotary_emb(rotary_pos_emb, q) for q in (q1, q2, q3)]
+
         if self.is_gqa:
             q2, q3, v2, v3 = (repeat(t, 'b g n d -> b (g r) n d', r = self.num_rep) for t in (q2, q3, v2, v3))
 
+        if has_cache:
+            cq2, cq3, cv3, clse23, cmsg = cache
+            q2_full = cat((cq2, q2), dim = -2)
+            q3_full = cat((cq3, q3), dim = -2)
+            v3_full = cat((cv3, v3), dim = -2)
+        else:
+            q2_full, q3_full, v3_full = q2, q3, v3
+
         q_left = stack((q1, q2))
-        q_right = stack((q2, q3))
+        q_right = stack((q2_full, q3_full))
 
         # unscaled exp values
 
         scores = einsum('... i d, ... j d -> ... i j', q_left, q_right) * self.scale
         scores = softclamp(scores, self.softclamp_value)
 
-        exp_scores = scores.exp()
+        mask_value = -torch.finfo(scores.dtype).max
 
         # causal masking
 
-        if self.causal:
-            i, j = exp_scores.shape[-2:]
+        if self.causal and not has_cache:
+            i, j = scores.shape[-2:]
             causal_mask = torch.ones((i, j), device = device, dtype = torch.bool).triu(1)
-            exp_scores = exp_scores.masked_fill(causal_mask, 0.)
+            scores = scores.masked_fill(causal_mask, mask_value)
 
         # padding masking
 
         if exists(mask):
-            exp_scores = einx.where('b j, c b h i j, -> c b h i j', mask, exp_scores, 0.)
+            scores = einx.where('b j, c b h i j, -> c b h i j', mask, scores, mask_value)
 
-        exp_scores12, exp_scores23 = exp_scores
+        scores12, scores23 = scores
 
         # aggregate
 
-        exp_scores23_v3 = einsum('b h i j, b h j d -> b h i d', exp_scores23, v3)
-        unnormalized_out = einsum('b h i j, b h j d -> b h i d', exp_scores12, exp_scores23_v3)
+        lse23_step = torch.logsumexp(scores23, dim = -1)
+        attn23 = scores23.softmax(dim = -1)
 
-        # elementwise multiply the root values (v2) with the aggregated messages from the rest of the tree
+        msg_step = einsum('b h i j, b h j d -> b h i d', attn23, v3_full)
 
-        out = v2 * unnormalized_out
+        if has_cache:
+            lse23 = cat((clse23, lse23_step), dim = -1)
+            msg = cat((cmsg, msg_step), dim = -2)
+        else:
+            lse23, msg = lse23_step, msg_step
 
-        # normalize
+        scores12 = scores12 + rearrange(lse23, 'b h j -> b h 1 j')
+        
+        attn12 = scores12.softmax(dim = -1)
 
-        exp_scores23_sum = exp_scores23.sum(dim = -1, keepdim = True)
+        out = einsum('b h i j, b h j d -> b h i d', attn12, msg)
 
-        denominator = einsum('b h i j, b h j d -> b h i d', exp_scores12, exp_scores23_sum)
+        # elementwise multiply root values
 
-        out = out / denominator.clamp_min(self.eps)
+        out = v2 * out
 
         # gate
 
@@ -145,4 +157,10 @@ class PolyAttention(Module):
 
         # combine heads
 
-        return self.to_out(self.merge_heads(out))
+        out = self.to_out(self.merge_heads(out))
+
+        if not return_cache:
+            return out
+
+        new_cache = (q2_full, q3_full, v3_full, lse23, msg)
+        return out, new_cache

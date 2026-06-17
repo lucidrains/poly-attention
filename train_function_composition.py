@@ -22,7 +22,7 @@ import fire
 from einops import rearrange
 from accelerate import Accelerator
 
-from poly_attention import PolyAttention
+from poly_attention import PolyAttention, NPolyAttention
 from x_transformers import Attention, FeedForward
 
 # helpers
@@ -70,10 +70,16 @@ def function_composition(
 # models
 
 class Block(Module):
-    def __init__(self, dim, heads = 8, dim_head = 64, use_poly = False):
+    def __init__(self, dim, heads = 8, dim_head = 64, use_poly = False, order = 2):
         super().__init__()
 
-        self.attn = PolyAttention(dim, heads = heads, dim_head = dim_head) if use_poly else Attention(dim, heads = heads, dim_head = dim_head, qk_norm = True)
+        if use_poly:
+            if order == 2:
+                self.attn = PolyAttention(dim, heads = heads, dim_head = dim_head)
+            else:
+                self.attn = NPolyAttention(dim, order = order, heads = heads, dim_head = dim_head)
+        else:
+            self.attn = Attention(dim, heads = heads, dim_head = dim_head, qk_norm = True)
 
         self.norm1 = RMSNorm(dim)
         self.norm2 = RMSNorm(dim)
@@ -94,14 +100,15 @@ class Model(Module):
         heads = 4,
         dim_head = 32,
         layers = 6,
-        use_poly = False
+        use_poly = False,
+        order = 2
     ):
         super().__init__()
         self.embedding = nn.Linear(vocab_size, dim)
         self.pos_enc = nn.Embedding(seq_len, dim)
 
         self.blocks = ModuleList([
-            Block(dim, heads = heads, dim_head = dim_head, use_poly = use_poly)
+            Block(dim, heads = heads, dim_head = dim_head, use_poly = use_poly, order = order)
             for _ in range(layers)
         ])
 
@@ -131,7 +138,8 @@ def train_model(
     lr: float,
     num_classes: int = 10,
     composition_depth: int = 2,
-    seed: int = 42
+    seed: int = 42,
+    order: int = 2
 ):
     torch.manual_seed(seed)
 
@@ -141,7 +149,7 @@ def train_model(
     if accelerator.is_main_process:
         wandb.init(
             project = "poly-attention-toy-task",
-            name = f"{model_name}-{layers}Layers",
+            name = f"{model_name}-Order{order}-{layers}Layers" if use_poly else f"{model_name}-{layers}Layers",
             config = dict(
                 model_type = model_name,
                 use_poly = use_poly,
@@ -152,6 +160,7 @@ def train_model(
                 heads = heads,
                 dim_head = dim_head,
                 layers = layers,
+                order = order,
             )
         )
 
@@ -162,7 +171,8 @@ def train_model(
         heads = heads,
         dim_head = dim_head,
         layers = layers,
-        use_poly = use_poly
+        use_poly = use_poly,
+        order = order
     )
 
     optimizer = Adam(model.parameters(), lr = lr)
@@ -212,7 +222,7 @@ def train_model(
                 train_accuracy = acc,
             ))
 
-            if divisible_by(epoch + 1, 100):
+            if divisible_by(epoch + 1, 10):
                 print(f"  Epoch {epoch+1:04d} | Loss: {loss.item():.4f} | Accuracy: {acc:.4f}")
 
     if accelerator.is_main_process:
@@ -230,7 +240,8 @@ def main(
     lr: float = 1e-3,
     num_classes: int = 10,
     composition_depth: int = 2,
-    seed: int = 42
+    seed: int = 42,
+    order: int = 2
 ):
     accelerator = Accelerator()
 
@@ -249,14 +260,15 @@ def main(
         lr = lr,
         num_classes = num_classes,
         composition_depth = composition_depth,
-        seed = seed
+        seed = seed,
+        order = order
     )
 
-    acc_base = train_fn("BaseSelfAttention", use_poly = False)
     acc_poly = train_fn("PolyAttention", use_poly = True)
+    acc_base = train_fn("BaseSelfAttention", use_poly = False)
 
     if accelerator.is_main_process:
-        print(f"Final Best Accuracies ({layers} Layers) -> Base: {acc_base:.4f} | Poly: {acc_poly:.4f}")
+        print(f"Final Best Accuracies ({layers} Layers, Order {order}) -> Base: {acc_base:.4f} | Poly: {acc_poly:.4f}")
 
 if __name__ == '__main__':
     fire.Fire(main)

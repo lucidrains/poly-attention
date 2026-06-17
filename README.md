@@ -26,6 +26,10 @@ x = torch.randn(1, 1024, 512)
 out = attn(x) # (1, 1024, 512)
 ```
 
+## Appreciation
+
+- [@dillfrescott](https://github.com/dillfrescott) for submitting a stability fix
+
 ## Citations
 
 ```bibtex
