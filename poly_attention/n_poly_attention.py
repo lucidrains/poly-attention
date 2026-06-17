@@ -8,8 +8,8 @@ import torch.nn.functional as F
 import einx
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
-from rotary_embedding_torch import apply_rotary_emb
-
+from einops.layers.torch import Rearrange
+from rotary_embedding_torch import apply_rotary_emb, RotaryEmbedding
 from functools import partial
 
 # constants
@@ -40,6 +40,7 @@ class NPolyAttention(Module):
         dim_head = 64,
         causal = False,
         softclamp_value = 20.,
+        use_rotary_embed = False,
         eps = 1e-9
     ):
         super().__init__()
@@ -58,10 +59,12 @@ class NPolyAttention(Module):
         self.causal = causal
         self.softclamp_value = softclamp_value
 
-        self.split_heads = Rearrange('b n (h d) -> b h n d', d = dim_head)
-        self.merge_heads = Rearrange('b h n d -> b n (h d)')
-
         self.is_gqa = heads != kv_heads
+
+        self.split_q_gates = Rearrange('b n (split h d) -> split b h n d', split = 2, h = self.heads)
+        self.split_kv = Rearrange('b n (split h d) -> split b h n d', split = order * 2, h = self.kv_heads)
+
+        self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
         if self.is_gqa:
             self.num_rep = heads // kv_heads
@@ -73,6 +76,8 @@ class NPolyAttention(Module):
 
         self.q_norms = nn.ModuleList([RMSNorm(dim_head) for _ in range(order + 1)])
 
+        self.rotary_emb = RotaryEmbedding(dim_head) if use_rotary_embed else None
+
         self.to_out = nn.Linear(dim_inner, dim)
 
     def forward(
@@ -83,13 +88,12 @@ class NPolyAttention(Module):
     ):
         device = x.device
 
-        q1, gates, *kv_chunks = [self.split_heads(t) for t in (*self.to_q_gates(x).chunk(2, dim = -1), *self.to_kv(x).chunk(self.order * 2, dim = -1))]
+        q1, gates = self.split_q_gates(self.to_q_gates(x))
+        kv_chunks = self.split_kv(self.to_kv(x))
+        q_rest, v_rest = kv_chunks.chunk(2, dim = 0)
 
-        q_rest = kv_chunks[:self.order]
-        v_rest = kv_chunks[self.order:]
-
-        qs = [q1] + q_rest
-        vs = v_rest
+        qs = [q1, *q_rest]
+        vs = [*v_rest]
 
         qs = [norm(q) for norm, q in zip(self.q_norms, qs)]
 
@@ -102,6 +106,9 @@ class NPolyAttention(Module):
 
         q_left = stack(qs[:-1])
         q_right = stack(qs[1:])
+
+        if not exists(rotary_pos_emb) and exists(self.rotary_emb):
+            q_left, q_right = self.rotary_emb.rotate_queries_with_cached_keys(q_left, q_right)
 
         # scores
 

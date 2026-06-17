@@ -102,3 +102,21 @@ def test_poly_attention_kv_cache():
     out_stepwise = torch.cat(out_stepwise, dim = -2)
 
     assert torch.allclose(out_parallel, out_stepwise, atol = 1e-5)
+
+def test_poly_attention_kv_cache_with_rotary():
+    attn = PolyAttention(dim = 128, heads = 4, dim_head = 32, causal = True, use_rotary_embed = True)
+
+    x = torch.randn(2, 5, 128)
+
+    out_parallel = attn(x)
+
+    cache = None
+    out_stepwise = []
+
+    for i in range(5):
+        out, cache = attn(x[:, i:i+1], cache = cache, return_cache = True)
+        out_stepwise.append(out)
+
+    out_stepwise = torch.cat(out_stepwise, dim = -2)
+
+    assert torch.allclose(out_parallel, out_stepwise, atol = 1e-5)
