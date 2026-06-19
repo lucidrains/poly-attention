@@ -1,6 +1,9 @@
 import pytest
 import torch
+
 from poly_attention import PolyAttention, NPolyAttention, Order2PolyAttention
+from poly_attention.poly_vit import PolyViT
+
 from rotary_embedding_torch import RotaryEmbedding
 
 param = pytest.mark.parametrize
@@ -120,3 +123,35 @@ def test_poly_attention_kv_cache_with_rotary():
     out_stepwise = torch.cat(out_stepwise, dim = -2)
 
     assert torch.allclose(out_parallel, out_stepwise, atol = 1e-5)
+
+@param('order', (2, 3, 4))
+def test_prenorm(order):
+    if order == 2:
+        attn = PolyAttention(dim = 128, heads = 4, dim_head = 32, prenorm = True)
+    else:
+        attn = NPolyAttention(dim = 128, order = order, heads = 4, dim_head = 32, prenorm = True)
+
+    x = torch.randn(2, 32, 128)
+    out = attn(x)
+
+    assert out.shape == (2, 32, 128)
+    assert not torch.isnan(out).any()
+
+@param('order', (2, 3))
+def test_poly_vit(order):
+    vit = PolyViT(
+        image_size = 32,
+        patch_size = 8,
+        num_classes = 10,
+        dim = 64,
+        depth = 2,
+        heads = 4,
+        mlp_dim = 128,
+        order = order
+    )
+
+    img = torch.randn(2, 3, 32, 32)
+    preds = vit(img)
+
+    assert preds.shape == (2, 10)
+    assert not torch.isnan(preds).any()

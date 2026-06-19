@@ -44,9 +44,12 @@ class Order2PolyAttention(Module):
         shared_kv = False,
         softclamp_value = 20.,
         use_rotary_embed = False,
+        prenorm = False,
         eps = 1e-9
     ):
         super().__init__()
+        self.norm = RMSNorm(dim) if prenorm else nn.Identity()
+
         self.eps = eps
         self.scale = dim_head ** -0.5
 
@@ -96,6 +99,8 @@ class Order2PolyAttention(Module):
         if has_cache:
             assert seq_len == 1, 'sequence length must be 1 when using kv cache'
             past_seq_len = cache[0].shape[-2]
+
+        x = self.norm(x)
 
         q1, gates = self.split_q_gates(self.to_q_gates(x))
         kv_chunks = self.split_kv(self.to_kv(x))
