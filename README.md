@@ -27,6 +27,28 @@ tokens = torch.randn(1, 1024, 512)
 out = attn(tokens) # (1, 1024, 512)
 ```
 
+A Vision Transformer based on Poly-Attention
+
+```python
+import torch
+from poly_attention import PolyViT
+
+vit = PolyViT(
+    image_size = 256,
+    patch_size = 32,
+    num_classes = 1000,
+    dim = 1024,
+    depth = 6,
+    heads = 16,
+    mlp_dim = 2048,
+    order = 2 # standard poly attention order 2
+)
+
+images = torch.randn(1, 3, 256, 256)
+
+preds = vit(images) # (1, 1000)
+```
+
 ## Appreciation
 
 - [@dillfrescott](https://github.com/dillfrescott) for submitting a stability fix
