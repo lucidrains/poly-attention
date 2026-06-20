@@ -13,9 +13,9 @@ from einops.layers.torch import Rearrange
 from rotary_embedding_torch import apply_rotary_emb, RotaryEmbedding
 
 try:
-    from poly_attention.fused_poly_attention import fused_poly_attention
+    from poly_attention.flash_poly_attention import flash_poly_attention
 except ImportError:
-    fused_poly_attention = None
+    flash_poly_attention = None
 
 # constants
 
@@ -81,7 +81,7 @@ def reference_poly_attention(
     # pass 2 - q1 attends to q2
 
     sim12 = einsum('b h i d, b h j d -> b h i j', q1, q2_pass2) * scale
-    
+
     if exists(softclamp_val):
         sim12 = softclamp(sim12, softclamp_val)
 
@@ -119,13 +119,13 @@ class Order2PolyAttention(Module):
         use_rotary_embed = False,
         prenorm = False,
         eps = 1e-9,
-        use_fused_kernel = None,
+        use_flash_kernel = None,
     ):
         super().__init__()
         self.norm = RMSNorm(dim) if prenorm else nn.Identity()
 
-        self.use_fused_kernel = default(use_fused_kernel, exists(fused_poly_attention))
-        assert not (self.use_fused_kernel and not exists(fused_poly_attention)), 'fused poly attention is not available'
+        self.use_flash_kernel = default(use_flash_kernel, exists(flash_poly_attention))
+        assert not (self.use_flash_kernel and not exists(flash_poly_attention)), 'fused poly attention is not available'
 
         self.maybe_softclamp = partial(softclamp, c = softclamp_value) if exists(softclamp_value) else nn.Identity()
 
@@ -229,17 +229,17 @@ class Order2PolyAttention(Module):
 
         # try to dispatch to fused kernel
 
-        can_use_fused = (
-            self.use_fused_kernel and
-            exists(fused_poly_attention) and
+        can_use_flash = (
+            self.use_flash_kernel and
+            exists(flash_poly_attention) and
             not has_cache and
             not return_cache and
             not exists(mask) and
             q1.is_cuda
         )
 
-        if can_use_fused:
-            out = fused_poly_attention(
+        if can_use_flash:
+            out = flash_poly_attention(
                 q1, q2_right, q3, v3_full,
                 softclamp_val = self.softclamp_value,
                 is_causal = self.causal

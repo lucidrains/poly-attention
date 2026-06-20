@@ -51,6 +51,7 @@ def train(
     run_name: str = 'baseline',
     refresh_every: int = 50,
     track_experiment_online: bool = False,
+    use_flash_kernel: bool = True,
 ):
     # data
 
@@ -89,6 +90,7 @@ def train(
         mlp_dim = mlp_dim,
         channels = channels,
         order = order,
+        use_flash_kernel = use_flash_kernel,
     )
 
     # optim

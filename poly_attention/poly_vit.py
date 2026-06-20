@@ -40,14 +40,14 @@ def FeedForward(dim, hidden_dim):
     )
 
 class Transformer(Module):
-    def __init__(self, dim, depth, heads, dim_head, mlp_dim, order = 2):
+    def __init__(self, dim, depth, heads, dim_head, mlp_dim, order = 2, use_flash_kernel = None):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
         self.layers = ModuleList([])
 
         for _ in range(depth):
             if order == 2:
-                attn = PolyAttention(dim = dim, heads = heads, dim_head = dim_head, causal = False, prenorm = True)
+                attn = PolyAttention(dim = dim, heads = heads, dim_head = dim_head, causal = False, prenorm = True, use_flash_kernel = use_flash_kernel)
             else:
                 attn = NPolyAttention(dim = dim, order = order, heads = heads, dim_head = dim_head, causal = False, prenorm = True)
 
@@ -63,7 +63,7 @@ class Transformer(Module):
         return self.norm(x)
 
 class PolyViT(Module):
-    def __init__(self, *, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels = 3, dim_head = 64, order = 2):
+    def __init__(self, *, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels = 3, dim_head = 64, order = 2, use_flash_kernel = None):
         super().__init__()
         image_height, image_width = pair(image_size)
         patch_height, patch_width = pair(patch_size)
@@ -85,7 +85,7 @@ class PolyViT(Module):
             dim = dim,
         )
 
-        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, order = order)
+        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, order = order, use_flash_kernel = use_flash_kernel)
 
         self.linear_head = nn.Linear(dim, num_classes, bias = False)
 

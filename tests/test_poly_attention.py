@@ -163,8 +163,8 @@ from poly_attention.poly_attention import reference_poly_attention
 @pytest.mark.parametrize('causal', (False, True))
 @pytest.mark.parametrize('softclamp_val', (None, 20.0))
 @pytest.mark.parametrize('seq_len', (31, 32, 127, 128))
-def test_fused_poly_attention(causal, softclamp_val, seq_len):
-    from poly_attention.fused_poly_attention import fused_poly_attention
+def test_flash_poly_attention(causal, softclamp_val, seq_len):
+    from poly_attention.flash_poly_attention import flash_poly_attention
 
     torch.manual_seed(42)
     shape = (2, 4, seq_len, 64)
@@ -178,7 +178,7 @@ def test_fused_poly_attention(causal, softclamp_val, seq_len):
     dout = torch.randn_like(out_pt)
     out_pt.backward(dout)
 
-    out_tr = fused_poly_attention(*tensors, softclamp_val = softclamp_val, is_causal = causal)
+    out_tr = flash_poly_attention(*tensors, softclamp_val = softclamp_val, is_causal = causal)
     out_tr.backward(dout)
 
     assert torch.allclose(out_pt, out_tr, atol = 1e-2), f'fwd max diff: {(out_pt - out_tr).abs().max().item()}'
@@ -200,11 +200,11 @@ def test_poly_attention_e2e(causal, softclamp_val, seq_len):
     x_pt = x.clone().detach().requires_grad_(True)
 
     module_pt = Order2PolyAttention(
-        dim = dim, heads = heads, causal = causal, softclamp_value = softclamp_val, use_fused_kernel = False
+        dim = dim, heads = heads, causal = causal, softclamp_value = softclamp_val, use_flash_kernel = False
     ).cuda()
 
     module_tr = Order2PolyAttention(
-        dim = dim, heads = heads, causal = causal, softclamp_value = softclamp_val, use_fused_kernel = True
+        dim = dim, heads = heads, causal = causal, softclamp_value = softclamp_val, use_flash_kernel = True
     ).cuda()
 
     module_tr.load_state_dict(module_pt.state_dict())

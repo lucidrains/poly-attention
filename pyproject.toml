@@ -1,6 +1,6 @@
 [project]
 name = "poly-attention"
-version = "0.1.1"
+version = "0.2.0"
 description = "PolyAttention"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
