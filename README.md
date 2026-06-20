@@ -49,6 +49,12 @@ images = torch.randn(1, 3, 256, 256)
 preds = vit(images) # (1, 1000)
 ```
 
+## Quick test
+
+```bash
+python train_function_composition.py --poly_layers=1 --base_layers=2
+```
+
 ## Appreciation
 
 - [@dillfrescott](https://github.com/dillfrescott) for submitting a stability fix
