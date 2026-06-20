@@ -5,13 +5,17 @@ from functools import partial
 import torch
 from torch import nn, einsum, stack, cat
 from torch.nn import Module, RMSNorm
-import torch.nn.functional as F
 
 import einx
-from einops import rearrange, repeat
+from einops import repeat
 from einops.layers.torch import Rearrange
 
 from rotary_embedding_torch import apply_rotary_emb, RotaryEmbedding
+
+try:
+    from poly_attention.fused_poly_attention import fused_poly_attention
+except ImportError:
+    fused_poly_attention = None
 
 # constants
 
@@ -28,8 +32,77 @@ def default(val, d):
 def divisible_by(num, den):
     return (num % den) == 0
 
-def softclamp(x, c):
-    return c * torch.tanh(x / c)
+def softclamp(x, clamp_value):
+    return clamp_value * torch.tanh(x / clamp_value)
+
+# attention
+
+def reference_poly_attention(
+    q1, q2_pass1, q2_pass2, q3, v3,
+    mask = None,
+    softclamp_val = None,
+    causal = False,
+    cache = None
+):
+    scale = q1.shape[-1] ** -0.5
+    has_cache = exists(cache)
+
+    # pass 1 - q2 attends to q3
+
+    sim23 = einsum('b h i d, b h j d -> b h i j', q2_pass1, q3) * scale
+
+    if exists(softclamp_val):
+        sim23 = softclamp(sim23, softclamp_val)
+
+    mask_value = -torch.finfo(sim23.dtype).max
+
+    if causal and not has_cache:
+        i, j = sim23.shape[-2:]
+        causal_mask = torch.ones((i, j), device = sim23.device, dtype = torch.bool).triu(1)
+        sim23 = sim23.masked_fill(causal_mask, mask_value)
+
+    if exists(mask):
+        sim23 = einx.where('b j, b h i j, -> b h i j', mask, sim23, mask_value)
+
+    # pass 1 attention and aggregation
+
+    lse23_step = sim23.logsumexp(dim = -1)
+    attn23 = sim23.softmax(dim = -1)
+    msg_step = einsum('b h i j, b h j d -> b h i d', attn23, v3)
+
+    if has_cache:
+        _, _, _, clse23, cmsg = cache
+        lse23 = cat((clse23, lse23_step), dim = -1)
+        msg = cat((cmsg, msg_step), dim = -2)
+    else:
+        lse23 = lse23_step
+        msg = msg_step
+
+    # pass 2 - q1 attends to q2
+
+    sim12 = einsum('b h i d, b h j d -> b h i j', q1, q2_pass2) * scale
+    
+    if exists(softclamp_val):
+        sim12 = softclamp(sim12, softclamp_val)
+
+    if causal and not has_cache:
+        i, j = sim12.shape[-2:]
+        causal_mask = torch.ones((i, j), device = sim12.device, dtype = torch.bool).triu(1)
+        sim12 = sim12.masked_fill(causal_mask, mask_value)
+
+    if exists(mask):
+        sim12 = einx.where('b j, b h i j, -> b h i j', mask, sim12, mask_value)
+
+    # add logsumexp from pass 1 as bias to pass 2
+
+    sim12 = einx.add('b h j, b h i j -> b h i j', lse23, sim12)
+
+    # pass 2 attention and aggregation
+
+    attn12 = sim12.softmax(dim = -1)
+    out = einsum('b h i j, b h j d -> b h i d', attn12, msg)
+
+    return out, lse23_step, msg_step
 
 # poly attention
 
@@ -42,13 +115,19 @@ class Order2PolyAttention(Module):
         dim_head = 64,
         causal = False,
         shared_kv = False,
-        softclamp_value = 20.,
+        softclamp_value = None,
         use_rotary_embed = False,
         prenorm = False,
-        eps = 1e-9
+        eps = 1e-9,
+        use_fused_kernel = None,
     ):
         super().__init__()
         self.norm = RMSNorm(dim) if prenorm else nn.Identity()
+
+        self.use_fused_kernel = default(use_fused_kernel, exists(fused_poly_attention))
+        assert not (self.use_fused_kernel and not exists(fused_poly_attention)), 'fused poly attention is not available'
+
+        self.maybe_softclamp = partial(softclamp, c = softclamp_value) if exists(softclamp_value) else nn.Identity()
 
         self.eps = eps
         self.scale = dim_head ** -0.5
@@ -145,45 +224,35 @@ class Order2PolyAttention(Module):
         if not exists(rotary_pos_emb) and exists(self.rotary_emb):
             q_left, q_right = self.rotary_emb.rotate_queries_with_cached_keys(q_left, q_right)
 
-        # sims
+        q1, q2_left = q_left[0], q_left[1]
+        q2_right, q3 = q_right[0], q_right[1]
 
-        scores = einsum('... i d, ... j d -> ... i j', q_left, q_right) * self.scale
-        scores = softclamp(scores, self.softclamp_value)
+        # try to dispatch to fused kernel
 
-        mask_value = -torch.finfo(scores.dtype).max
+        can_use_fused = (
+            self.use_fused_kernel and
+            exists(fused_poly_attention) and
+            not has_cache and
+            not return_cache and
+            not exists(mask) and
+            q1.is_cuda
+        )
 
-        # causal masking
-
-        if self.causal and not has_cache:
-            i, j = scores.shape[-2:]
-            causal_mask = torch.ones((i, j), device = device, dtype = torch.bool).triu(1)
-            scores = scores.masked_fill(causal_mask, mask_value)
-
-        # padding masking
-
-        if exists(mask):
-            scores = einx.where('b j, c b h i j, -> c b h i j', mask, scores, mask_value)
-
-        scores12, scores23 = scores
-
-        # aggregate
-
-        lse23_step = torch.logsumexp(scores23, dim = -1)
-        attn23 = scores23.softmax(dim = -1)
-
-        msg_step = einsum('b h i j, b h j d -> b h i d', attn23, v3_full)
-
-        if has_cache:
-            lse23 = cat((clse23, lse23_step), dim = -1)
-            msg = cat((cmsg, msg_step), dim = -2)
+        if can_use_fused:
+            out = fused_poly_attention(
+                q1, q2_right, q3, v3_full,
+                softclamp_val = self.softclamp_value,
+                is_causal = self.causal
+            )
+            lse23_step, msg_step = None, None
         else:
-            lse23, msg = lse23_step, msg_step
-
-        scores12 = scores12 + rearrange(lse23, 'b h j -> b h 1 j')
-
-        attn12 = scores12.softmax(dim = -1)
-
-        out = einsum('b h i j, b h j d -> b h i d', attn12, msg)
+            out, lse23_step, msg_step = reference_poly_attention(
+                q1, q2_left, q2_right, q3_full, v3_full,
+                mask = mask,
+                softclamp_val = self.softclamp_value,
+                causal = self.causal,
+                cache = cache
+            )
 
         # elementwise multiply root values
 
@@ -200,5 +269,8 @@ class Order2PolyAttention(Module):
         if not return_cache:
             return out
 
-        new_cache = (q2_full, q3_full, v3_full, lse23, msg)
+        lse23_full = cat((clse23, lse23_step), dim=-1) if has_cache else lse23_step
+        msg_full = cat((cmsg, msg_step), dim=-2) if has_cache else msg_step
+
+        new_cache = (q2_full, q3_full, v3_full, lse23_full, msg_full)
         return out, new_cache

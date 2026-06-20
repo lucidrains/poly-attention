@@ -110,10 +110,10 @@ def base_decoding(
 # model
 
 class Block(Module):
-    def __init__(self, dim, heads = 8, dim_head = 64, order = 2):
+    def __init__(self, dim, heads = 8, dim_head = 64, order = 2, use_fused_kernel = False):
         super().__init__()
         if order == 2:
-            self.attn = PolyAttention(dim, heads = heads, dim_head = dim_head, causal = True)
+            self.attn = PolyAttention(dim, heads = heads, dim_head = dim_head, causal = True, use_fused_kernel = use_fused_kernel)
         else:
             self.attn = NPolyAttention(dim, order = order, heads = heads, dim_head = dim_head, causal = True)
         self.norm1 = RMSNorm(dim)
@@ -135,12 +135,13 @@ class PolyLM(Module):
         seq_len,
         heads = 8,
         dim_head = 64,
-        order = 2
+        order = 2,
+        use_fused_kernel = False
     ):
         super().__init__()
         self.token_emb = nn.Embedding(num_tokens, dim)
         self.rotary_emb = RotaryEmbedding(dim_head)
-        self.layers = ModuleList([Block(dim, heads=heads, dim_head=dim_head, order=order) for _ in range(depth)])
+        self.layers = ModuleList([Block(dim, heads=heads, dim_head=dim_head, order=order, use_fused_kernel=use_fused_kernel) for _ in range(depth)])
         self.norm = RMSNorm(dim)
         self.to_logits = nn.Linear(dim, num_tokens, bias = False)
 
@@ -205,7 +206,8 @@ def main(
     depth: int = 6,
     heads: int = 8,
     dim_head: int = 64,
-    order: int = 2
+    order: int = 2,
+    use_fused_kernel: bool = False
 ):
     generate_length = default(generate_length, seq_len)
     prime_length = default(prime_length, int(generate_length * 0.25))
@@ -221,7 +223,8 @@ def main(
         seq_len = seq_len,
         heads = heads,
         dim_head = dim_head,
-        order = order
+        order = order,
+        use_fused_kernel = use_fused_kernel
     )
 
     # prepare enwik8 data
@@ -249,7 +252,7 @@ def main(
 
     # training
 
-    pbar = tqdm.tqdm(range(num_batches + 1), mininterval = 1.0, desc = "training")
+    pbar = tqdm.tqdm(range(num_batches + 1), mininterval = 1.0, desc = "training", ncols=120)
     for i in pbar:
         model.train()
 

@@ -44,9 +44,10 @@ def test_generalized_poly_attention_equivalence(causal, kv_heads):
     dim = 128
     heads = 4
     dim_head = 32
+    softclamp_value = 20.
 
-    model_order2 = Order2PolyAttention(dim = dim, heads = heads, kv_heads = kv_heads, dim_head = dim_head, causal = causal)
-    model_n = NPolyAttention(dim = dim, order = 2, heads = heads, kv_heads = kv_heads, dim_head = dim_head, causal = causal)
+    model_order2 = Order2PolyAttention(dim = dim, heads = heads, kv_heads = kv_heads, dim_head = dim_head, causal = causal, softclamp_value = softclamp_value)
+    model_n = NPolyAttention(dim = dim, order = 2, heads = heads, kv_heads = kv_heads, dim_head = dim_head, causal = causal, softclamp_value = softclamp_value)
 
     state_dict = model_order2.state_dict()
     state_dict['q_norms.0.weight'] = state_dict.pop('q1_norm.weight')
@@ -155,3 +156,65 @@ def test_poly_vit(order):
 
     assert preds.shape == (2, 10)
     assert not torch.isnan(preds).any()
+
+from poly_attention.poly_attention import reference_poly_attention
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = 'cuda required')
+@pytest.mark.parametrize('causal', (False, True))
+@pytest.mark.parametrize('softclamp_val', (None, 20.0))
+@pytest.mark.parametrize('seq_len', (31, 32, 127, 128))
+def test_fused_poly_attention(causal, softclamp_val, seq_len):
+    from poly_attention.fused_poly_attention import fused_poly_attention
+
+    torch.manual_seed(42)
+    shape = (2, 4, seq_len, 64)
+
+    tensors = [torch.randn(shape, requires_grad = True, device = 'cuda') for _ in range(4)]
+    pt_tensors = [t.clone().detach().requires_grad_(True) for t in tensors]
+
+    q1, q2, q3, v3 = pt_tensors
+
+    out_pt, _, _ = reference_poly_attention(q1, q2, q2, q3, v3, softclamp_val = softclamp_val, causal = causal)
+    dout = torch.randn_like(out_pt)
+    out_pt.backward(dout)
+
+    out_tr = fused_poly_attention(*tensors, softclamp_val = softclamp_val, is_causal = causal)
+    out_tr.backward(dout)
+
+    assert torch.allclose(out_pt, out_tr, atol = 1e-2), f'fwd max diff: {(out_pt - out_tr).abs().max().item()}'
+
+    for i, (pt_t, tr_t) in enumerate(zip(pt_tensors, tensors)):
+        assert torch.allclose(pt_t.grad, tr_t.grad, atol = 1e-2), f'grad {i} max diff: {(pt_t.grad - tr_t.grad).abs().max().item()}'
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = 'cuda required')
+@pytest.mark.parametrize('causal', (False, True))
+@pytest.mark.parametrize('softclamp_val', (None, 20.0))
+@pytest.mark.parametrize('seq_len', (31, 64))
+def test_poly_attention_e2e(causal, softclamp_val, seq_len):
+    from poly_attention.poly_attention import Order2PolyAttention
+
+    torch.manual_seed(42)
+    dim = 64
+    heads = 4
+    x = torch.randn(2, seq_len, dim, requires_grad = True, device = 'cuda')
+    x_pt = x.clone().detach().requires_grad_(True)
+
+    module_pt = Order2PolyAttention(
+        dim = dim, heads = heads, causal = causal, softclamp_value = softclamp_val, use_fused_kernel = False
+    ).cuda()
+
+    module_tr = Order2PolyAttention(
+        dim = dim, heads = heads, causal = causal, softclamp_value = softclamp_val, use_fused_kernel = True
+    ).cuda()
+
+    module_tr.load_state_dict(module_pt.state_dict())
+
+    out_pt = module_pt(x_pt)
+    dout = torch.randn_like(out_pt)
+    out_pt.backward(dout)
+
+    out_tr = module_tr(x)
+    out_tr.backward(dout)
+
+    assert torch.allclose(out_pt, out_tr, atol = 1e-2), f'fwd max diff: {(out_pt - out_tr).abs().max().item()}'
+    assert torch.allclose(x_pt.grad, x.grad, atol = 1e-2), f'grad max diff: {(x_pt.grad - x.grad).abs().max().item()}'
