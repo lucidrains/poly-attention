@@ -218,3 +218,19 @@ def test_poly_attention_e2e(causal, softclamp_val, seq_len):
 
     assert torch.allclose(out_pt, out_tr, atol = 1e-2), f'fwd max diff: {(out_pt - out_tr).abs().max().item()}'
     assert torch.allclose(x_pt.grad, x.grad, atol = 1e-2), f'grad max diff: {(x_pt.grad - x.grad).abs().max().item()}'
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = 'cuda required')
+def test_compile_poly_attention():
+    from poly_attention import PolyAttention
+    from torch.amp import autocast
+
+    attn = PolyAttention(dim=128, heads=4, use_rotary_embed=True, use_flash_kernel=True).cuda()
+    x = torch.randn(2, 64, 128, device='cuda')
+
+    model = torch.compile(attn)
+    with autocast('cuda'):
+        out = model(x)
+        out.sum().backward()
+
+    assert out.shape == (2, 64, 128)
+    assert not torch.isnan(out).any()

@@ -83,7 +83,7 @@ def _poly_flash_fwd_kernel(
 
         # compute attention scores
 
-        sim = tl.dot(q, k, allow_tf32=False) * sm_scale
+        sim = (tl.dot(q, k, allow_tf32=False) * sm_scale).to(tl.float32)
 
         # softclamp if needed
 
@@ -230,7 +230,7 @@ def _poly_flash_bwd_kernel(
 
         # compute attention scores
 
-        sim = tl.dot(q, tl.trans(k), allow_tf32=False) * sm_scale
+        sim = (tl.dot(q, tl.trans(k), allow_tf32=False) * sm_scale).to(tl.float32)
 
         # softclamp if needed
 
@@ -273,9 +273,9 @@ def _poly_flash_bwd_kernel(
         # accumulate gradients
 
         dv += tl.dot(tl.trans(p.to(v.dtype)), do, allow_tf32=False)
-        dk += tl.dot(tl.trans(ds.to(q.dtype)), q, allow_tf32=False) * sm_scale
+        dk += (tl.dot(tl.trans(ds.to(q.dtype)), q, allow_tf32=False) * sm_scale).to(tl.float32)
 
-        dq_chunk = tl.dot(ds.to(k.dtype), k, allow_tf32=False) * sm_scale
+        dq_chunk = (tl.dot(ds.to(k.dtype), k, allow_tf32=False) * sm_scale).to(tl.float32)
 
         tl.atomic_add(dq_ptrs, dq_chunk, mask=(offs_m[:, None] < N_CTX_Q) & (offs_k[None, :] < BLOCK_DMODEL))
 
