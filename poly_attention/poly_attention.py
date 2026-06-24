@@ -1,9 +1,10 @@
 # Chakrabarti et al. https://arxiv.org/abs/2602.02422
 
+from __future__ import annotations
 from functools import partial
 
 import torch
-from torch import nn, einsum, stack, cat
+from torch import nn, einsum, stack, cat, Tensor
 from torch.nn import Module, RMSNorm
 
 import einx
@@ -28,6 +29,9 @@ def exists(val):
 
 def default(val, d):
     return val if exists(val) else d
+
+def cast_tuple(t, length = 1):
+    return t if isinstance(t, tuple) else ((t,) * length)
 
 def divisible_by(num, den):
     return (num % den) == 0
@@ -118,11 +122,19 @@ class Order2PolyAttention(Module):
         softclamp_value = None,
         use_rotary_embed = False,
         prenorm = False,
+        separate_context_norms = False,
         eps = 1e-9,
         use_flash_kernel = None,
     ):
         super().__init__()
         self.norm = RMSNorm(dim) if prenorm else nn.Identity()
+
+        self.context_norms = None
+        if separate_context_norms and prenorm:
+            self.context_norms = nn.ModuleList([
+                RMSNorm(dim),
+                RMSNorm(dim)
+            ])
 
         self.use_flash_kernel = default(use_flash_kernel, exists(flash_poly_attention))
         assert not (self.use_flash_kernel and not exists(flash_poly_attention)), 'fused poly attention is not available'
@@ -148,7 +160,7 @@ class Order2PolyAttention(Module):
         self.is_gqa = heads != kv_heads
 
         self.split_q_gates = Rearrange('b n (split h d) -> split b h n d', split = 2, h = self.heads)
-        kv_split = 2 if self.shared_kv else 4
+        kv_split = 1 if self.shared_kv else 2
         self.split_kv = Rearrange('b n (split h d) -> split b h n d', split = kv_split, h = self.kv_heads)
 
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
@@ -158,8 +170,11 @@ class Order2PolyAttention(Module):
 
         self.to_q_gates = LinearNoBias(dim, dim_inner * 2)
 
-        kv_mult = 2 if shared_kv else 4
-        self.to_kv = LinearNoBias(dim, dim_inner_kv * kv_mult)
+        kv_mult = 1 if shared_kv else 2
+        self.to_kvs = nn.ModuleList([
+            LinearNoBias(dim, dim_inner_kv * kv_mult),
+            LinearNoBias(dim, dim_inner_kv * kv_mult)
+        ])
 
         self.q1_norm = RMSNorm(dim_head)
         self.q2_norm = RMSNorm(dim_head)
@@ -169,28 +184,49 @@ class Order2PolyAttention(Module):
 
         self.to_out = nn.Linear(dim_inner, dim)
 
-    def forward(self, x, mask = None, rotary_pos_emb = None, cache = None, return_cache = False):
+    def forward(
+        self,
+        x,
+        context: Tensor | tuple[Tensor, ...] | None = None,
+        mask = None,
+        rotary_pos_emb = None,
+        cache = None,
+        return_cache = False
+    ):
         seq_len, device = x.shape[-2], x.device
 
         has_cache = exists(cache)
-        past_seq_len = 0
 
         if has_cache:
             assert seq_len == 1, 'sequence length must be 1 when using kv cache'
-            past_seq_len = cache[0].shape[-2]
 
+        orig_x = x
         x = self.norm(x)
 
         q1, gates = self.split_q_gates(self.to_q_gates(x))
-        kv_chunks = self.split_kv(self.to_kv(x))
 
-        # maybe shared kv
+        # contexts
+
+        has_context = exists(context)
+        context = default(context, orig_x)
+        context = cast_tuple(context, 2)
+        assert len(context) == 2
+
+        if exists(self.context_norms):
+            ctx1, ctx2 = (norm(c) for c, norm in zip(context, self.context_norms))
+        else:
+            ctx1, ctx2 = context if has_context else (x, x)
+
+        # kvs
+
+        kv1, kv2 = [self.split_kv(to_kv(c)) for c, to_kv in zip((ctx1, ctx2), self.to_kvs)]
 
         if self.shared_kv:
-            q2, q3 = kv_chunks
+            (q2,), (q3,) = kv1, kv2
             v2, v3 = q2, q3
         else:
-            q2, q3, v2, v3 = kv_chunks
+            q2, v2 = kv1
+            q3, v3 = kv2
 
         # qk rmsnorm
 

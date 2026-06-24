@@ -77,8 +77,9 @@ def test_generalized_poly_attention_equivalence(causal, kv_heads):
 @param('causal', (False, True))
 @param('kv_heads', (1, 2, 4))
 @param('order', (2, 3, 4))
-def test_n_poly_attention(causal, kv_heads, order):
-    attn = NPolyAttention(dim = 128, order = order, heads = 4, kv_heads = kv_heads, dim_head = 32, causal = causal)
+@param('shared_kv', (False, True))
+def test_n_poly_attention(causal, kv_heads, order, shared_kv):
+    attn = NPolyAttention(dim = 128, order = order, heads = 4, kv_heads = kv_heads, dim_head = 32, causal = causal, shared_kv = shared_kv)
     x = torch.randn(2, 32, 128)
 
     rotary_emb = RotaryEmbedding(32)
@@ -289,3 +290,70 @@ def test_poly_attention_mask_equality(causal, softclamp_value, seq_len):
 
     assert torch.allclose(out_pt, out_n, atol = 1e-2), f'n-poly fwd max diff: {(out_pt - out_n).abs().max().item()}'
     assert torch.allclose(x_pt.grad, x_n.grad, atol = 1e-2), f'n-poly grad max diff: {(x_pt.grad - x_n.grad).abs().max().item()}'
+
+def test_poly_attention_context():
+    attn = PolyAttention(dim = 64, heads = 4, causal = False)
+    x = torch.randn(2, 16, 64)
+    ctx1 = torch.randn(2, 16, 64)
+    ctx2 = torch.randn(2, 16, 64)
+
+    # Context as single tensor
+    out_single = attn(x, context=ctx1)
+    assert out_single.shape == (2, 16, 64)
+
+    # Context as tuple
+    out_tuple = attn(x, context=(ctx1, ctx2))
+    assert out_tuple.shape == (2, 16, 64)
+
+def test_n_poly_attention_context():
+    attn = NPolyAttention(dim = 64, order = 3, heads = 4, causal = False)
+    x = torch.randn(2, 16, 64)
+    ctx1 = torch.randn(2, 16, 64)
+    ctx2 = torch.randn(2, 16, 64)
+    ctx3 = torch.randn(2, 16, 64)
+
+    # Context as single tensor
+    out_single = attn(x, context=ctx1)
+    assert out_single.shape == (2, 16, 64)
+
+    # Context as tuple
+    out_tuple = attn(x, context=(ctx1, ctx2, ctx3))
+    assert out_tuple.shape == (2, 16, 64)
+
+def test_context_equivalence():
+    dim = 64
+    heads = 4
+
+    attn_poly = PolyAttention(dim=dim, heads=heads, causal=False, use_flash_kernel=False)
+    attn_n = NPolyAttention(dim=dim, order=2, heads=heads, causal=False)
+
+    # Copy parameters from PolyAttention to NPolyAttention
+    state_dict = attn_poly.state_dict()
+    n_state_dict = state_dict.copy()
+
+    # Map q_norms
+    n_state_dict['q_norms.0.weight'] = n_state_dict.pop('q1_norm.weight')
+    n_state_dict['q_norms.1.weight'] = n_state_dict.pop('q2_norm.weight')
+    n_state_dict['q_norms.2.weight'] = n_state_dict.pop('q3_norm.weight')
+
+    # Map to_kvs
+    n_state_dict['to_kvs.0.weight'] = n_state_dict.pop('to_kvs.0.weight')
+    n_state_dict['to_kvs.1.weight'] = n_state_dict.pop('to_kvs.1.weight')
+
+    attn_n.load_state_dict(n_state_dict, strict=False)
+
+    x = torch.randn(2, 16, dim)
+    ctx = x.clone() + 1.0
+
+    out_poly = attn_poly(x, context=ctx)
+    out_n = attn_n(x, context=ctx)
+
+    assert torch.allclose(out_poly, out_n, atol=1e-3)
+
+    # Test with tuple context
+    ctx1 = x.clone() + 1.0
+    ctx2 = x.clone() - 1.0
+    out_poly_tuple = attn_poly(x, context=(ctx1, ctx2))
+    out_n_tuple = attn_n(x, context=(ctx1, ctx2))
+
+    assert torch.allclose(out_poly_tuple, out_n_tuple, atol=1e-3)

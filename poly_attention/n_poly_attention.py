@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import torch
-from torch import nn, einsum, stack
+from torch import nn, einsum, stack, Tensor
 from torch.nn import Module, RMSNorm
 import torch.nn.functional as F
 
@@ -24,6 +24,9 @@ def exists(val):
 def default(val, d):
     return val if exists(val) else d
 
+def cast_tuple(t, length = 1):
+    return t if isinstance(t, tuple) else ((t,) * length)
+
 def divisible_by(num, den):
     return (num % den) == 0
 
@@ -39,13 +42,19 @@ class NPolyAttention(Module):
         kv_heads = None,
         dim_head = 64,
         causal = False,
-        softclamp_value = 20.,
+        shared_kv = False,
+        softclamp_value = None,
         use_rotary_embed = False,
         prenorm = False,
+        separate_context_norms = False,
         eps = 1e-9
     ):
         super().__init__()
         self.norm = RMSNorm(dim) if prenorm else nn.Identity()
+
+        self.context_norms = None
+        if separate_context_norms and prenorm:
+            self.context_norms = nn.ModuleList([RMSNorm(dim) for _ in range(order)])
 
         self.eps = eps
         self.scale = dim_head ** -0.5
@@ -60,12 +69,13 @@ class NPolyAttention(Module):
         dim_inner_kv = dim_head * kv_heads
 
         self.causal = causal
+        self.shared_kv = shared_kv
         self.softclamp_value = softclamp_value
 
         self.is_gqa = heads != kv_heads
 
         self.split_q_gates = Rearrange('b n (split h d) -> split b h n d', split = 2, h = self.heads)
-        self.split_kv = Rearrange('b n (split h d) -> split b h n d', split = order * 2, h = self.kv_heads)
+        self.split_kv = Rearrange('b n (split h d) -> split b h n d', split = 1 if shared_kv else 2, h = self.kv_heads)
 
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
@@ -75,7 +85,9 @@ class NPolyAttention(Module):
         self.order = order
 
         self.to_q_gates = LinearNoBias(dim, dim_inner * 2)
-        self.to_kv = LinearNoBias(dim, dim_inner_kv * (order * 2))
+
+        kv_mult = 1 if shared_kv else 2
+        self.to_kvs = nn.ModuleList([LinearNoBias(dim, dim_inner_kv * kv_mult) for _ in range(order)])
 
         self.q_norms = nn.ModuleList([RMSNorm(dim_head) for _ in range(order + 1)])
 
@@ -86,16 +98,38 @@ class NPolyAttention(Module):
     def forward(
         self,
         x,
+        context: Tensor | tuple[Tensor, ...] | None = None,
         mask = None,
         rotary_pos_emb = None
     ):
         device = x.device
 
+        orig_x = x
         x = self.norm(x)
 
         q1, gates = self.split_q_gates(self.to_q_gates(x))
-        kv_chunks = self.split_kv(self.to_kv(x))
-        q_rest, v_rest = kv_chunks.chunk(2, dim = 0)
+
+        # contexts
+
+        has_context = exists(context)
+        context = default(context, orig_x)
+        context = cast_tuple(context, self.order)
+        assert len(context) == self.order
+
+        if exists(self.context_norms):
+            context = tuple(norm(c) for c, norm in zip(context, self.context_norms))
+        else:
+            context = context if has_context else ((x,) * self.order)
+
+        # kvs
+
+        kvs = [self.split_kv(to_kv(c)) for c, to_kv in zip(context, self.to_kvs)]
+
+        if self.shared_kv:
+            q_rest = stack([kv[0] for kv in kvs])
+            v_rest = q_rest
+        else:
+            q_rest, v_rest = map(stack, zip(*kvs))
 
         qs = (q1, *q_rest)
         vs = tuple(v_rest)
