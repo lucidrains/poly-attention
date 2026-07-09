@@ -203,18 +203,25 @@ class Order2PolyAttention(Module):
         if exists(rotary_pos_emb):
             q1, q2, q3 = [apply_rotary_emb(rotary_pos_emb, q) for q in (q1, q2, q3)]
 
-        if self.is_gqa:
-            q2, q3, v2, v3 = (repeat(t, 'b g n d -> b (g r) n d', r = self.num_rep) for t in (q2, q3, v2, v3))
-
+       
         # handle cache
 
         if has_cache:
             cq2, cq3, cv3, clse23, cmsg = cache
-            q2_full = cat((cq2, q2), dim = -2)
-            q3_full = cat((cq3, q3), dim = -2)
-            v3_full = cat((cv3, v3), dim = -2)
+            
+            q2_cache = cat((cq2, q2), dim = -2)
+            q3_cache = cat((cq3, q3), dim = -2)
+            v3_cache = cat((cv3, v3), dim = -2)
         else:
-            q2_full, q3_full, v3_full = q2, q3, v3
+            q2_cache, q3_cache, v3_cache = q2, q3, v3
+
+        if self.is_gqa:
+    
+            q2, q3, v2, v3 = (repeat(t, 'b g n d -> b (g r) n d', r = self.num_rep) for t in (q2, q3, v2, v3))
+        
+            q2_full, q3_full, v3_full = (repeat(t, 'b g n d -> b (g r) n d', r = self.num_rep) for t in (q2_cache, q3_cache, v3_cache))
+        else:
+            q2_full, q3_full, v3_full = q2_cache, q3_cache, v3_cache
 
         q_left = stack((q1, q2))
         q_right = stack((q2_full, q3_full))
@@ -228,6 +235,7 @@ class Order2PolyAttention(Module):
         q2_right, q3 = q_right[0], q_right[1]
 
         # try to dispatch to fused kernel
+
 
         can_use_flash = (
             self.use_flash_kernel and
@@ -272,5 +280,6 @@ class Order2PolyAttention(Module):
         lse23_full = cat((clse23, lse23_step), dim=-1) if has_cache else lse23_step
         msg_full = cat((cmsg, msg_step), dim=-2) if has_cache else msg_step
 
-        new_cache = (q2_full, q3_full, v3_full, lse23_full, msg_full)
+        new_cache = (q2_cache, q3_cache, v3_cache, lse23_full, msg_full)
+
         return out, new_cache
