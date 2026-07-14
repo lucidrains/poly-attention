@@ -7,7 +7,7 @@ from torch import nn, einsum, stack, Tensor
 from torch.nn import Module, RMSNorm
 
 import einx
-from einops import rearrange, repeat
+from einops import repeat
 from einops.layers.torch import Rearrange
 
 from rotary_embedding_torch import apply_rotary_emb, RotaryEmbedding
@@ -47,8 +47,9 @@ class NPolyAttention(Module):
         use_rotary_embed = False,
         prenorm = False,
         separate_context_norms = False,
-        use_root_value_as_attn_gate = True,
-        eps = 1e-9
+        multiply_root_value = False,
+        use_root_value_as_attn_gate = False,
+        attn_gate = False
     ):
         super().__init__()
         assert order > 1, 'order must be greater than 1'
@@ -58,7 +59,6 @@ class NPolyAttention(Module):
         if separate_context_norms and prenorm:
             self.context_norms = nn.ModuleList([RMSNorm(dim) for _ in range(order)])
 
-        self.eps = eps
         self.scale = dim_head ** -0.5
 
         kv_heads = default(kv_heads, heads)
@@ -73,12 +73,24 @@ class NPolyAttention(Module):
         self.causal = causal
         self.shared_kv = shared_kv
         self.softclamp_value = softclamp_value
+
+        self.multiply_root_value = multiply_root_value
         self.use_root_value_as_attn_gate = use_root_value_as_attn_gate
+        self.attn_gate = attn_gate
 
         self.is_gqa = heads != kv_heads
 
-        self.split_q = Rearrange('b n (h d) -> b h n d', h = self.heads)
-        self.split_kv = Rearrange('b n (split h d) -> split b h n d', split = 1 if shared_kv else 2, h = self.kv_heads)
+        assert not (use_root_value_as_attn_gate and (self.is_gqa or self.shared_kv)), 'cannot use root value as attention gate if using GQA or shared KV'
+
+        q_split = 2 if attn_gate else 1
+        self.split_q = Rearrange('b n (split h d) -> split b h n d', split = q_split, h = self.heads)
+
+        self.has_root_v = multiply_root_value and not shared_kv
+        kv1_split = 2 if self.has_root_v else 1
+        self.split_kv1 = Rearrange('b n (split h d) -> split b h n d', split = kv1_split, h = self.kv_heads)
+
+        kv_split = 1 if shared_kv else 2
+        self.split_kv = Rearrange('b n (split h d) -> split b h n d', split = kv_split, h = self.kv_heads)
 
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
@@ -87,10 +99,13 @@ class NPolyAttention(Module):
 
         self.order = order
 
-        self.to_q = LinearNoBias(dim, dim_inner)
+        self.to_q = LinearNoBias(dim, dim_inner * q_split)
 
         kv_mult = 1 if shared_kv else 2
-        self.to_kvs = nn.ModuleList([LinearNoBias(dim, dim_inner_kv * kv_mult) for _ in range(order)])
+        self.to_kvs = nn.ModuleList([
+            LinearNoBias(dim, dim_inner_kv * kv1_split),
+            *[LinearNoBias(dim, dim_inner_kv * kv_mult) for _ in range(order - 1)]
+        ])
 
         self.q_norms = nn.ModuleList([RMSNorm(dim_head) for _ in range(order + 1)])
 
@@ -110,7 +125,12 @@ class NPolyAttention(Module):
         orig_x = x
         x = self.norm(x)
 
-        q1 = self.split_q(self.to_q(x))
+        q_and_maybe_gates = self.split_q(self.to_q(x))
+
+        if self.attn_gate:
+            q1, gates = q_and_maybe_gates
+        else:
+            q1 = q_and_maybe_gates[0]
 
         # contexts
 
@@ -126,16 +146,19 @@ class NPolyAttention(Module):
 
         # kvs
 
-        kvs = [self.split_kv(to_kv(c)) for c, to_kv in zip(context, self.to_kvs)]
+        kv1 = self.split_kv1(self.to_kvs[0](context[0]))
+        kvs_rest = [self.split_kv(to_kv(c)) for c, to_kv in zip(context[1:], self.to_kvs[1:])]
 
         if self.shared_kv:
-            q_rest = stack([kv[0] for kv in kvs])
-            v_rest = q_rest
+            qs_rest = (kv1[0], *[kv[0] for kv in kvs_rest])
+            root_value = qs_rest[0]
+            vs_for_aggregation = qs_rest[1:]
         else:
-            q_rest, v_rest = map(stack, zip(*kvs))
+            qs_rest = (kv1[0], *[kv[0] for kv in kvs_rest])
+            vs_for_aggregation = tuple(kv[1] for kv in kvs_rest)
+            root_value = kv1[1] if self.has_root_v else None
 
-        qs = (q1, *q_rest)
-        vs = tuple(v_rest)
+        qs = (q1, *qs_rest)
 
         qs = tuple(norm(q) for norm, q in zip(self.q_norms, qs))
 
@@ -144,7 +167,9 @@ class NPolyAttention(Module):
 
         if self.is_gqa:
             qs = (qs[0], *(repeat(t, 'b g n d -> b (g r) n d', r = self.num_rep) for t in qs[1:]))
-            vs = tuple(repeat(t, 'b g n d -> b (g r) n d', r = self.num_rep) for t in vs)
+            vs_for_aggregation = tuple(repeat(t, 'b g n d -> b (g r) n d', r = self.num_rep) for t in vs_for_aggregation)
+            if exists(root_value):
+                root_value = repeat(root_value, 'b g n d -> b (g r) n d', r = self.num_rep)
 
         q_left = stack(qs[:-1])
         q_right = stack(qs[1:])
@@ -174,23 +199,25 @@ class NPolyAttention(Module):
 
         # aggregate from right to left
 
-        root_value, *_, out = vs
-
+        out = vs_for_aggregation[-1]
         current_scores_k = scores[-1]
-        scores12 = scores[0]
 
-        for k in range(self.order - 1, 0, -1):
+        for k in range(self.order - 1, 1, -1):
             lse_k = torch.logsumexp(current_scores_k, dim = -1)
             attn_k = current_scores_k.softmax(dim = -1)
 
             msg = einsum('b h j k, b h k d -> b h j d', attn_k, out)
 
-            if k > 1:
-                out = vs[k - 1] * msg
-                current_scores_k = scores[k - 1] + rearrange(lse_k, 'b h j -> b h 1 j')
-            else:
-                out = msg
-                scores12 = scores[0] + rearrange(lse_k, 'b h j -> b h 1 j')
+            out = vs_for_aggregation[k - 2] * msg
+            current_scores_k = einx.add('b h j, b h i j -> b h i j', lse_k, scores[k - 1])
+
+        # final step (k = 1)
+
+        lse_1 = torch.logsumexp(current_scores_k, dim = -1)
+        attn_1 = current_scores_k.softmax(dim = -1)
+
+        out = einsum('b h j k, b h k d -> b h j d', attn_1, out)
+        scores12 = einx.add('b h j, b h i j -> b h i j', lse_1, scores[0])
 
         # final combine
 
@@ -200,10 +227,16 @@ class NPolyAttention(Module):
 
         # elementwise multiply root values
 
-        if self.use_root_value_as_attn_gate:
-            root_value = root_value.sigmoid()
+        if self.multiply_root_value:
+            if self.use_root_value_as_attn_gate:
+                root_value = root_value.sigmoid()
 
-        out = root_value * out
+            out = root_value * out
+
+        # attention gate
+
+        if self.attn_gate:
+            out = out * gates.sigmoid()
 
         # combine heads
 

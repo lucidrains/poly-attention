@@ -79,9 +79,9 @@ class Block(Module):
 
         if use_poly:
             if order == 2:
-                self.attn = PolyAttention(dim, heads = heads, dim_head = dim_head, shared_kv = shared_kv, use_flash_kernel = use_flash_kernel, use_root_value_as_attn_gate = use_root_value_as_attn_gate)
+                self.attn = PolyAttention(dim, heads = heads, dim_head = dim_head, shared_kv = shared_kv, use_flash_kernel = use_flash_kernel, use_root_value_as_attn_gate = use_root_value_as_attn_gate, multiply_root_value = use_root_value_as_attn_gate)
             else:
-                self.attn = NPolyAttention(dim, order = order, heads = heads, dim_head = dim_head, use_root_value_as_attn_gate = use_root_value_as_attn_gate)
+                self.attn = NPolyAttention(dim, order = order, heads = heads, dim_head = dim_head, use_root_value_as_attn_gate = use_root_value_as_attn_gate, multiply_root_value = use_root_value_as_attn_gate)
         else:
             self.attn = Attention(dim, heads = heads, dim_head = dim_head, flash = default(use_flash_kernel, False))
 

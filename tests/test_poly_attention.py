@@ -40,19 +40,29 @@ def test_poly_attention_mask(kv_heads):
 
 @param('causal', (False, True))
 @param('kv_heads', (1, 2, 4))
-def test_generalized_poly_attention_equivalence(causal, kv_heads):
+@param('multiply_root_value', (False, True))
+@param('use_root_value_as_attn_gate', (False, True))
+@param('attn_gate', (False, True))
+def test_generalized_poly_attention_equivalence(causal, kv_heads, multiply_root_value, use_root_value_as_attn_gate, attn_gate):
     dim = 128
     heads = 4
     dim_head = 32
     softclamp_value = 20.
 
-    model_order2 = Order2PolyAttention(dim = dim, heads = heads, kv_heads = kv_heads, dim_head = dim_head, causal = causal, softclamp_value = softclamp_value)
-    model_n = NPolyAttention(dim = dim, order = 2, heads = heads, kv_heads = kv_heads, dim_head = dim_head, causal = causal, softclamp_value = softclamp_value)
+    is_gqa = heads != kv_heads
+    if use_root_value_as_attn_gate and is_gqa:
+        pytest.skip('cannot use root value as attention gate if using GQA')
+
+    model_order2 = Order2PolyAttention(
+        dim = dim, heads = heads, kv_heads = kv_heads, dim_head = dim_head, causal = causal, softclamp_value = softclamp_value,
+        multiply_root_value = multiply_root_value, use_root_value_as_attn_gate = use_root_value_as_attn_gate, attn_gate = attn_gate
+    )
+    model_n = NPolyAttention(
+        dim = dim, order = 2, heads = heads, kv_heads = kv_heads, dim_head = dim_head, causal = causal, softclamp_value = softclamp_value,
+        multiply_root_value = multiply_root_value, use_root_value_as_attn_gate = use_root_value_as_attn_gate, attn_gate = attn_gate
+    )
 
     state_dict = model_order2.state_dict()
-    state_dict['q_norms.0.weight'] = state_dict.pop('q1_norm.weight')
-    state_dict['q_norms.1.weight'] = state_dict.pop('q2_norm.weight')
-    state_dict['q_norms.2.weight'] = state_dict.pop('q3_norm.weight')
 
     model_n.load_state_dict(state_dict, strict = False)
 
@@ -269,9 +279,6 @@ def test_poly_attention_mask_equality(causal, softclamp_value, seq_len):
     module_tr.load_state_dict(state_dict)
 
     n_state_dict = state_dict.copy()
-    n_state_dict['q_norms.0.weight'] = n_state_dict.pop('q1_norm.weight')
-    n_state_dict['q_norms.1.weight'] = n_state_dict.pop('q2_norm.weight')
-    n_state_dict['q_norms.2.weight'] = n_state_dict.pop('q3_norm.weight')
     module_n.load_state_dict(n_state_dict, strict=False)
 
     out_pt = module_pt(x_pt, mask=mask)
@@ -330,11 +337,6 @@ def test_context_equivalence():
     # Copy parameters from PolyAttention to NPolyAttention
     state_dict = attn_poly.state_dict()
     n_state_dict = state_dict.copy()
-
-    # Map q_norms
-    n_state_dict['q_norms.0.weight'] = n_state_dict.pop('q1_norm.weight')
-    n_state_dict['q_norms.1.weight'] = n_state_dict.pop('q2_norm.weight')
-    n_state_dict['q_norms.2.weight'] = n_state_dict.pop('q3_norm.weight')
 
     # Map to_kvs
     n_state_dict['to_kvs.0.weight'] = n_state_dict.pop('to_kvs.0.weight')

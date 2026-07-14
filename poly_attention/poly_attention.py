@@ -12,6 +12,7 @@ from einops import repeat
 from einops.layers.torch import Rearrange
 
 from rotary_embedding_torch import apply_rotary_emb, RotaryEmbedding
+from torch_einops_utils import maybe, safe_cat
 
 try:
     from poly_attention.flash_poly_attention import flash_poly_attention
@@ -74,13 +75,10 @@ def reference_poly_attention(
     attn23 = sim23.softmax(dim = -1)
     msg_step = einsum('b h i j, b h j d -> b h i d', attn23, v3)
 
-    if has_cache:
-        _, _, _, clse23, cmsg = cache
-        lse23 = cat((clse23, lse23_step), dim = -1)
-        msg = cat((cmsg, msg_step), dim = -2)
-    else:
-        lse23 = lse23_step
-        msg = msg_step
+    _, _, _, clse23, cmsg = cache if has_cache else (None, None, None, None, None)
+
+    lse23 = safe_cat((clse23, lse23_step), dim = -1)
+    msg = safe_cat((cmsg, msg_step), dim = -2)
 
     # pass 2 - q1 attends to q2
 
@@ -123,8 +121,9 @@ class Order2PolyAttention(Module):
         use_rotary_embed = False,
         prenorm = False,
         separate_context_norms = False,
-        use_root_value_as_attn_gate = True,
-        eps = 1e-9,
+        multiply_root_value = False,
+        use_root_value_as_attn_gate = False,
+        attn_gate = False,
         use_flash_kernel = None,
     ):
         super().__init__()
@@ -140,9 +139,6 @@ class Order2PolyAttention(Module):
         self.use_flash_kernel = default(use_flash_kernel, exists(flash_poly_attention))
         assert not (self.use_flash_kernel and not exists(flash_poly_attention)), 'fused poly attention is not available'
 
-        self.maybe_softclamp = partial(softclamp, c = softclamp_value) if exists(softclamp_value) else nn.Identity()
-
-        self.eps = eps
         self.scale = dim_head ** -0.5
 
         kv_heads = default(kv_heads, heads)
@@ -157,11 +153,21 @@ class Order2PolyAttention(Module):
         self.causal = causal
         self.shared_kv = shared_kv
         self.softclamp_value = softclamp_value
+        self.multiply_root_value = multiply_root_value
         self.use_root_value_as_attn_gate = use_root_value_as_attn_gate
+        self.attn_gate = attn_gate
 
         self.is_gqa = heads != kv_heads
 
-        self.split_q = Rearrange('b n (h d) -> b h n d', h = self.heads)
+        assert not (use_root_value_as_attn_gate and (self.is_gqa or self.shared_kv)), 'cannot use root value as attention gate if using GQA or shared KV'
+
+        q_split = 2 if attn_gate else 1
+        self.split_q = Rearrange('b n (split h d) -> split b h n d', split = q_split, h = self.heads)
+
+        self.has_root_v = multiply_root_value and not shared_kv
+        kv1_split = 2 if self.has_root_v else 1
+        self.split_kv1 = Rearrange('b n (split h d) -> split b h n d', split = kv1_split, h = self.kv_heads)
+
         kv_split = 1 if self.shared_kv else 2
         self.split_kv = Rearrange('b n (split h d) -> split b h n d', split = kv_split, h = self.kv_heads)
 
@@ -170,17 +176,19 @@ class Order2PolyAttention(Module):
         if self.is_gqa:
             self.num_rep = heads // kv_heads
 
-        self.to_q = LinearNoBias(dim, dim_inner)
+        self.to_q = LinearNoBias(dim, dim_inner * q_split)
 
         kv_mult = 1 if shared_kv else 2
         self.to_kvs = nn.ModuleList([
-            LinearNoBias(dim, dim_inner_kv * kv_mult),
+            LinearNoBias(dim, dim_inner_kv * kv1_split),
             LinearNoBias(dim, dim_inner_kv * kv_mult)
         ])
 
-        self.q1_norm = RMSNorm(dim_head)
-        self.q2_norm = RMSNorm(dim_head)
-        self.q3_norm = RMSNorm(dim_head)
+        self.q_norms = nn.ModuleList([
+            RMSNorm(dim_head),
+            RMSNorm(dim_head),
+            RMSNorm(dim_head)
+        ])
 
         self.rotary_emb = RotaryEmbedding(dim_head) if use_rotary_embed else None
 
@@ -205,7 +213,12 @@ class Order2PolyAttention(Module):
         orig_x = x
         x = self.norm(x)
 
-        q1 = self.split_q(self.to_q(x))
+        q_and_maybe_gates = self.split_q(self.to_q(x))
+
+        if self.attn_gate:
+            q1, gates = q_and_maybe_gates
+        else:
+            q1 = q_and_maybe_gates[0]
 
         # contexts
 
@@ -221,43 +234,42 @@ class Order2PolyAttention(Module):
 
         # kvs
 
-        kv1, kv2 = [self.split_kv(to_kv(c)) for c, to_kv in zip((ctx1, ctx2), self.to_kvs)]
+        kv1 = self.split_kv1(self.to_kvs[0](ctx1))
+        kv2 = self.split_kv(self.to_kvs[1](ctx2))
 
         if self.shared_kv:
-            (q2,), (q3,) = kv1, kv2
-            v2, v3 = q2, q3
+            qs = (q1, kv1[0], kv2[0])
+            v2, v3 = kv1[0], kv2[0]
         else:
-            q2, v2 = kv1
+            q2 = kv1[0]
+            v2 = kv1[1] if self.has_root_v else None
             q3, v3 = kv2
+            qs = (q1, q2, q3)
 
         # qk rmsnorm
 
-        q1 = self.q1_norm(q1)
-        q2 = self.q2_norm(q2)
-        q3 = self.q3_norm(q3)
+        qs = tuple(norm(q) for norm, q in zip(self.q_norms, qs))
 
         # rotary external
 
         if exists(rotary_pos_emb):
-            q1, q2, q3 = [apply_rotary_emb(rotary_pos_emb, q) for q in (q1, q2, q3)]
+            qs = tuple(apply_rotary_emb(rotary_pos_emb, q) for q in qs)
 
+        q1, q2, q3 = qs
 
         # handle cache
 
-        if has_cache:
-            cq2, cq3, cv3, clse23, cmsg = cache
+        cq2, cq3, cv3, clse23, cmsg = cache if has_cache else (None, None, None, None, None)
 
-            q2_cache = cat((cq2, q2), dim = -2)
-            q3_cache = cat((cq3, q3), dim = -2)
-            v3_cache = cat((cv3, v3), dim = -2)
-        else:
-            q2_cache, q3_cache, v3_cache = q2, q3, v3
+        q2_cache = safe_cat((cq2, q2), dim = -2)
+        q3_cache = safe_cat((cq3, q3), dim = -2)
+        v3_cache = safe_cat((cv3, v3), dim = -2)
 
         if self.is_gqa:
+            match_kv = maybe(lambda t: repeat(t, 'b g n d -> b (g r) n d', r = self.num_rep))
 
-            q2, q3, v2, v3 = (repeat(t, 'b g n d -> b (g r) n d', r = self.num_rep) for t in (q2, q3, v2, v3))
-
-            q2_full, q3_full, v3_full = (repeat(t, 'b g n d -> b (g r) n d', r = self.num_rep) for t in (q2_cache, q3_cache, v3_cache))
+            q2, q3, v2, v3 = map(match_kv, (q2, q3, v2, v3))
+            q2_full, q3_full, v3_full = map(match_kv, (q2_cache, q3_cache, v3_cache))
         else:
             q2_full, q3_full, v3_full = q2_cache, q3_cache, v3_cache
 
@@ -273,7 +285,6 @@ class Order2PolyAttention(Module):
         q2_right, q3 = q_right[0], q_right[1]
 
         # try to dispatch to fused kernel
-
 
         can_use_flash = (
             self.use_flash_kernel and
@@ -302,10 +313,16 @@ class Order2PolyAttention(Module):
 
         # elementwise multiply root values
 
-        if self.use_root_value_as_attn_gate:
-            v2 = v2.sigmoid()
+        if self.multiply_root_value:
+            if self.use_root_value_as_attn_gate:
+                v2 = v2.sigmoid()
 
-        out = v2 * out
+            out = v2 * out
+
+        # attention gate
+
+        if self.attn_gate:
+            out = out * gates.sigmoid()
 
         # combine heads
 
@@ -314,8 +331,8 @@ class Order2PolyAttention(Module):
         if not return_cache:
             return out
 
-        lse23_full = cat((clse23, lse23_step), dim=-1) if has_cache else lse23_step
-        msg_full = cat((cmsg, msg_step), dim=-2) if has_cache else msg_step
+        lse23_full = safe_cat((clse23, lse23_step), dim = -1)
+        msg_full = safe_cat((cmsg, msg_step), dim = -2)
 
         new_cache = (q2_cache, q3_cache, v3_cache, lse23_full, msg_full)
 
