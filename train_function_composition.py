@@ -74,14 +74,14 @@ def function_composition(
 # models
 
 class Block(Module):
-    def __init__(self, dim, heads = 8, dim_head = 64, use_poly = False, order = 2, shared_kv = False, use_flash_kernel = None):
+    def __init__(self, dim, heads = 8, dim_head = 64, use_poly = False, order = 2, shared_kv = False, use_flash_kernel = None, use_root_value_as_attn_gate = True):
         super().__init__()
 
         if use_poly:
             if order == 2:
-                self.attn = PolyAttention(dim, heads = heads, dim_head = dim_head, shared_kv = shared_kv, use_flash_kernel = use_flash_kernel)
+                self.attn = PolyAttention(dim, heads = heads, dim_head = dim_head, shared_kv = shared_kv, use_flash_kernel = use_flash_kernel, use_root_value_as_attn_gate = use_root_value_as_attn_gate)
             else:
-                self.attn = NPolyAttention(dim, order = order, heads = heads, dim_head = dim_head)
+                self.attn = NPolyAttention(dim, order = order, heads = heads, dim_head = dim_head, use_root_value_as_attn_gate = use_root_value_as_attn_gate)
         else:
             self.attn = Attention(dim, heads = heads, dim_head = dim_head, flash = default(use_flash_kernel, False))
 
@@ -105,14 +105,15 @@ class Model(Module):
         use_poly = False,
         order = 2,
         shared_kv = False,
-        use_flash_kernel = None
+        use_flash_kernel = None,
+        use_root_value_as_attn_gate = True
     ):
         super().__init__()
         self.embedding = nn.Linear(vocab_size, dim)
         self.pos_enc = nn.Embedding(seq_len, dim)
 
         self.blocks = ModuleList([
-            Block(dim, heads = heads, dim_head = dim_head, use_poly = use_poly, order = order, shared_kv = shared_kv, use_flash_kernel = use_flash_kernel)
+            Block(dim, heads = heads, dim_head = dim_head, use_poly = use_poly, order = order, shared_kv = shared_kv, use_flash_kernel = use_flash_kernel, use_root_value_as_attn_gate = use_root_value_as_attn_gate)
             for _ in range(layers)
         ])
 
@@ -147,7 +148,8 @@ def train_model(
     order: int = 2,
     shared_kv: bool = False,
     use_flash_kernel = None,
-    wandb_mode: str = 'disabled'
+    wandb_mode: str = 'disabled',
+    use_root_value_as_attn_gate: bool = True
 ):
     torch.manual_seed(seed)
 
@@ -169,7 +171,7 @@ def train_model(
     model = Model(
         vocab_size = vocab_size, seq_len = seq_len, dim = dim, heads = heads, dim_head = dim_head,
         layers = layers, use_poly = use_poly, order = order, shared_kv = shared_kv,
-        use_flash_kernel = use_flash_kernel
+        use_flash_kernel = use_flash_kernel, use_root_value_as_attn_gate = use_root_value_as_attn_gate
     )
 
     optimizer = Adam(model.parameters(), lr = lr)
@@ -231,7 +233,8 @@ def main(
     order: int = 2,
     shared_kv: bool = False,
     use_flash_kernel = None,
-    wandb_mode: str = 'disabled'
+    wandb_mode: str = 'disabled',
+    use_root_value_as_attn_gate: bool = True
 ):
     accelerator = Accelerator()
     accelerator.print(f"Running on {accelerator.device} with Poly layers: {poly_layers}, Base layers: {base_layers}.")
@@ -240,7 +243,8 @@ def main(
         train_model, accelerator = accelerator, dim = dim, heads = heads, dim_head = dim_head,
         epochs = epochs, batch_size = batch_size, lr = lr, num_classes = num_classes,
         composition_depth = composition_depth, seed = seed, order = order,
-        use_flash_kernel = use_flash_kernel, wandb_mode = wandb_mode
+        use_flash_kernel = use_flash_kernel, wandb_mode = wandb_mode,
+        use_root_value_as_attn_gate = use_root_value_as_attn_gate
     )
 
     acc_poly, epoch_poly = train_fn("PolyAttention", layers = poly_layers, use_poly = True, shared_kv = shared_kv)

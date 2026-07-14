@@ -123,6 +123,7 @@ class Order2PolyAttention(Module):
         use_rotary_embed = False,
         prenorm = False,
         separate_context_norms = False,
+        use_root_value_as_attn_gate = True,
         eps = 1e-9,
         use_flash_kernel = None,
     ):
@@ -156,10 +157,11 @@ class Order2PolyAttention(Module):
         self.causal = causal
         self.shared_kv = shared_kv
         self.softclamp_value = softclamp_value
+        self.use_root_value_as_attn_gate = use_root_value_as_attn_gate
 
         self.is_gqa = heads != kv_heads
 
-        self.split_q_gates = Rearrange('b n (split h d) -> split b h n d', split = 2, h = self.heads)
+        self.split_q = Rearrange('b n (h d) -> b h n d', h = self.heads)
         kv_split = 1 if self.shared_kv else 2
         self.split_kv = Rearrange('b n (split h d) -> split b h n d', split = kv_split, h = self.kv_heads)
 
@@ -168,7 +170,7 @@ class Order2PolyAttention(Module):
         if self.is_gqa:
             self.num_rep = heads // kv_heads
 
-        self.to_q_gates = LinearNoBias(dim, dim_inner * 2)
+        self.to_q = LinearNoBias(dim, dim_inner)
 
         kv_mult = 1 if shared_kv else 2
         self.to_kvs = nn.ModuleList([
@@ -203,7 +205,7 @@ class Order2PolyAttention(Module):
         orig_x = x
         x = self.norm(x)
 
-        q1, gates = self.split_q_gates(self.to_q_gates(x))
+        q1 = self.split_q(self.to_q(x))
 
         # contexts
 
@@ -239,12 +241,12 @@ class Order2PolyAttention(Module):
         if exists(rotary_pos_emb):
             q1, q2, q3 = [apply_rotary_emb(rotary_pos_emb, q) for q in (q1, q2, q3)]
 
-       
+
         # handle cache
 
         if has_cache:
             cq2, cq3, cv3, clse23, cmsg = cache
-            
+
             q2_cache = cat((cq2, q2), dim = -2)
             q3_cache = cat((cq3, q3), dim = -2)
             v3_cache = cat((cv3, v3), dim = -2)
@@ -252,9 +254,9 @@ class Order2PolyAttention(Module):
             q2_cache, q3_cache, v3_cache = q2, q3, v3
 
         if self.is_gqa:
-    
+
             q2, q3, v2, v3 = (repeat(t, 'b g n d -> b (g r) n d', r = self.num_rep) for t in (q2, q3, v2, v3))
-        
+
             q2_full, q3_full, v3_full = (repeat(t, 'b g n d -> b (g r) n d', r = self.num_rep) for t in (q2_cache, q3_cache, v3_cache))
         else:
             q2_full, q3_full, v3_full = q2_cache, q3_cache, v3_cache
@@ -300,11 +302,10 @@ class Order2PolyAttention(Module):
 
         # elementwise multiply root values
 
+        if self.use_root_value_as_attn_gate:
+            v2 = v2.sigmoid()
+
         out = v2 * out
-
-        # gate
-
-        out = out * gates.sigmoid()
 
         # combine heads
 

@@ -1,16 +1,16 @@
 from __future__ import annotations
+from functools import partial
 
 import torch
+import torch.nn.functional as F
 from torch import nn, einsum, stack, Tensor
 from torch.nn import Module, RMSNorm
-import torch.nn.functional as F
 
 import einx
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
-from einops.layers.torch import Rearrange
+
 from rotary_embedding_torch import apply_rotary_emb, RotaryEmbedding
-from functools import partial
 
 # constants
 
@@ -47,9 +47,11 @@ class NPolyAttention(Module):
         use_rotary_embed = False,
         prenorm = False,
         separate_context_norms = False,
+        use_root_value_as_attn_gate = True,
         eps = 1e-9
     ):
         super().__init__()
+        assert order > 1, 'order must be greater than 1'
         self.norm = RMSNorm(dim) if prenorm else nn.Identity()
 
         self.context_norms = None
@@ -71,10 +73,11 @@ class NPolyAttention(Module):
         self.causal = causal
         self.shared_kv = shared_kv
         self.softclamp_value = softclamp_value
+        self.use_root_value_as_attn_gate = use_root_value_as_attn_gate
 
         self.is_gqa = heads != kv_heads
 
-        self.split_q_gates = Rearrange('b n (split h d) -> split b h n d', split = 2, h = self.heads)
+        self.split_q = Rearrange('b n (h d) -> b h n d', h = self.heads)
         self.split_kv = Rearrange('b n (split h d) -> split b h n d', split = 1 if shared_kv else 2, h = self.kv_heads)
 
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
@@ -84,7 +87,7 @@ class NPolyAttention(Module):
 
         self.order = order
 
-        self.to_q_gates = LinearNoBias(dim, dim_inner * 2)
+        self.to_q = LinearNoBias(dim, dim_inner)
 
         kv_mult = 1 if shared_kv else 2
         self.to_kvs = nn.ModuleList([LinearNoBias(dim, dim_inner_kv * kv_mult) for _ in range(order)])
@@ -107,7 +110,7 @@ class NPolyAttention(Module):
         orig_x = x
         x = self.norm(x)
 
-        q1, gates = self.split_q_gates(self.to_q_gates(x))
+        q1 = self.split_q(self.to_q(x))
 
         # contexts
 
@@ -171,7 +174,7 @@ class NPolyAttention(Module):
 
         # aggregate from right to left
 
-        v_bar = vs[-1]
+        root_value, *_, out = vs
 
         current_scores_k = scores[-1]
         scores12 = scores[0]
@@ -180,30 +183,27 @@ class NPolyAttention(Module):
             lse_k = torch.logsumexp(current_scores_k, dim = -1)
             attn_k = current_scores_k.softmax(dim = -1)
 
-            msg = einsum('b h j k, b h k d -> b h j d', attn_k, v_bar)
+            msg = einsum('b h j k, b h k d -> b h j d', attn_k, out)
 
             if k > 1:
-                v_bar = vs[k - 1] * msg
+                out = vs[k - 1] * msg
                 current_scores_k = scores[k - 1] + rearrange(lse_k, 'b h j -> b h 1 j')
             else:
-                v_bar = msg
+                out = msg
                 scores12 = scores[0] + rearrange(lse_k, 'b h j -> b h 1 j')
 
         # final combine
 
         attn12 = scores12.softmax(dim = -1)
 
-        out = einsum('b h i j, b h j d -> b h i d', attn12, v_bar)
+        out = einsum('b h i j, b h j d -> b h i d', attn12, out)
 
         # elementwise multiply root values
 
-        if self.order > 1:
-            v2 = vs[0]
-            out = v2 * out
+        if self.use_root_value_as_attn_gate:
+            root_value = root_value.sigmoid()
 
-        # gate
-
-        out = out * gates.sigmoid()
+        out = root_value * out
 
         # combine heads
 
