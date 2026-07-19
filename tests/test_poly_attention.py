@@ -359,3 +359,24 @@ def test_context_equivalence():
     out_n_tuple = attn_n(x, context=(ctx1, ctx2))
 
     assert torch.allclose(out_poly_tuple, out_n_tuple, atol=1e-3)
+
+@param('causal', (False, True))
+@param('deep_cross_attention', (False, True))
+def test_poly_transformer(deep_cross_attention, causal):
+    from poly_attention.poly_transformer import PolyTransformer
+
+    dim = 64
+    heads = 4
+    dim_head = 16
+    batch = 2
+    seq_len = 16
+    depth = 3
+
+    model = PolyTransformer(dim = dim, depth = depth, heads = heads, dim_head = dim_head, causal = causal, deep_cross_attention = deep_cross_attention)
+
+    x = torch.randn(batch, seq_len, dim)
+    mask = torch.ones(batch, seq_len, dtype = torch.bool)
+    mask[:, seq_len // 2:] = False
+
+    out = model(x, mask = mask)
+    assert out.shape == (batch, seq_len, dim)

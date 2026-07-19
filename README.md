@@ -83,3 +83,27 @@ python train_function_composition.py --poly_layers=1 --base_layers=2
     url     = {https://arxiv.org/abs/2606.04032},
 }
 ```
+
+```bibtex
+@misc{kimiteam2026attentionresiduals,
+    title   = {Attention Residuals},
+    author  = {Kimi Team and Guangyu Chen and Yu Zhang and Jianlin Su and Weixin Xu and Siyuan Pan and Yaoyu Wang and Yucheng Wang and Guanduo Chen and Bohong Yin and Yutian Chen and Junjie Yan and Ming Wei and Y. Zhang and Fanqing Meng and Chao Hong and Xiaotong Xie and Shaowei Liu and Enzhe Lu and Yunpeng Tai and Yanru Chen and Xin Men and Haiqing Guo and Y. Charles and Haoyu Lu and Lin Sui and Jinguo Zhu and Zaida Zhou and Weiran He and Weixiao Huang and Xinran Xu and Yuzhi Wang and Guokun Lai and Yulun Du and Yuxin Wu and Zhilin Yang and Xinyu Zhou},
+    year    = {2026},
+    eprint  = {2603.15031},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CL},
+    url     = {https://arxiv.org/abs/2603.15031},
+}
+```
+
+```bibtex
+@misc{heddes2025deepcrossattentionsuperchargingtransformerresidual,
+    title   = {DeepCrossAttention: Supercharging Transformer Residual Connections},
+    author  = {Mike Heddes and Adel Javanmard and Kyriakos Axiotis and Gang Fu and MohammadHossein Bateni and Vahab Mirrokni},
+    year    = {2025},
+    eprint  = {2502.06785},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2502.06785},
+}
+```

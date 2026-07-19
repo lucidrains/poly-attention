@@ -4,3 +4,4 @@ from poly_attention.n_poly_attention import NPolyAttention
 PolyAttention = Order2PolyAttention
 
 from poly_attention.poly_vit import PolyViT
+from poly_attention.poly_transformer import PolyTransformer
