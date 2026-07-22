@@ -3,7 +3,7 @@ from functools import partial
 
 import torch
 import torch.nn.functional as F
-from torch import nn, einsum, stack, Tensor
+from torch import nn, einsum, stack, Tensor, is_tensor
 from torch.nn import Module, RMSNorm
 
 import einx
@@ -25,8 +25,12 @@ def exists(val):
 def default(val, d):
     return val if exists(val) else d
 
+def first(t):
+    return t[0]
+
 def cast_tuple(t, length = 1):
-    return t if isinstance(t, tuple) else ((t,) * length)
+    return (t,) * length if is_tensor(t) or not isinstance(t, tuple) else t
+
 
 def divisible_by(num, den):
     return (num % den) == 0
@@ -120,12 +124,12 @@ class NPolyAttention(Module):
         x,
         context: Tensor | tuple[Tensor, ...] | None = None,
         mask = None,
+        context_mask: Tensor | tuple[Tensor | None, ...] | None = None,
         rotary_pos_emb = None,
         cache = None,
         return_cache = False
     ):
-        device = x.device
-        seq_len = x.shape[-2]
+        seq_len, device = x.shape[-2], x.device
 
         has_cache = exists(cache)
         if has_cache:
@@ -139,13 +143,26 @@ class NPolyAttention(Module):
         if self.attn_gate:
             q1, gates = q_and_maybe_gates
         else:
-            q1 = q_and_maybe_gates[0]
+            q1 = first(q_and_maybe_gates)
 
         # contexts
+
         has_context = exists(context)
         context = default(context, orig_x)
         context = cast_tuple(context, self.order)
         assert len(context) == self.order
+
+        if self.multiply_root_value:
+            assert first(context).shape[-2] == seq_len, 'first context sequence length (context[0]) must match base sequence x when multiply_root_value is True'
+
+
+        if exists(context_mask):
+            context_mask = cast_tuple(context_mask, self.order)
+            assert len(context_mask) == self.order
+        elif not has_context and exists(mask):
+            context_mask = (mask,) * self.order
+        else:
+            context_mask = (None,) * self.order
 
         if exists(self.context_norms):
             context = tuple(norm(c) for c, norm in zip(context, self.context_norms))
@@ -153,15 +170,16 @@ class NPolyAttention(Module):
             context = context if has_context else ((x,) * self.order)
 
         # kvs
-        kv1 = self.split_kv1(self.to_kvs[0](context[0]))
+
+        kv1 = self.split_kv1(first(self.to_kvs)(first(context)))
         kvs_rest = [self.split_kv(to_kv(c)) for c, to_kv in zip(context[1:], self.to_kvs[1:])]
 
         if self.shared_kv:
-            qs_rest = (kv1[0], *[kv[0] for kv in kvs_rest])
-            root_value = qs_rest[0]
+            qs_rest = (first(kv1), *[first(kv) for kv in kvs_rest])
+            root_value = first(qs_rest)
             vs_for_aggregation = qs_rest[1:]
         else:
-            qs_rest = (kv1[0], *[kv[0] for kv in kvs_rest])
+            qs_rest = (first(kv1), *[first(kv) for kv in kvs_rest])
             vs_for_aggregation = tuple(kv[1] for kv in kvs_rest)
             root_value = kv1[1] if self.has_root_v else None
 
@@ -172,7 +190,7 @@ class NPolyAttention(Module):
         if exists(rotary_pos_emb):
             qs = tuple(apply_rotary_emb(rotary_pos_emb, q) for q in qs)
 
-        q1 = qs[0]
+        q1 = first(qs)
         qs_rest = qs[1:]
 
         if has_cache:
@@ -183,7 +201,8 @@ class NPolyAttention(Module):
             c_lses = (None,) * (self.order - 1)
             c_msgs = (None,) * (self.order - 1)
 
-        # Connect history
+        # connect history
+
         qs_rest_cache = tuple(safe_cat((cq, q), dim = -2) for cq, q in zip(c_qs, qs_rest))
         vs_cache = tuple(safe_cat((cv, v), dim = -2) for cv, v in zip(c_vs, vs_for_aggregation))
 
@@ -199,30 +218,50 @@ class NPolyAttention(Module):
             qs_rest_right = qs_rest_cache
             vs_full = vs_cache
 
-        q_left = stack((q1, *qs_rest_left[:-1]))
-        q_right = stack(qs_rest_right)
+        q_left_list = [q1, *qs_rest_left[:-1]]
+        q_right_list = list(qs_rest_right)
 
         if not exists(rotary_pos_emb) and exists(self.rotary_emb):
-            q_left, q_right = self.rotary_emb.rotate_queries_with_cached_keys(q_left, q_right)
+            rotated = [
+                self.rotary_emb.rotate_queries_with_cached_keys(ql, qr)
+                for ql, qr in zip(q_left_list, q_right_list)
+            ]
+            q_left_list, q_right_list = zip(*rotated)
 
-        scores = einsum('... i d, ... j d -> ... i j', q_left, q_right) * self.scale
+        # scores
 
-        if exists(self.softclamp_value):
-            scores = softclamp(scores, self.softclamp_value)
+        scores = []
+        for idx, (ql, qr, context_mask) in enumerate(zip(q_left_list, q_right_list, context_mask)):
+            is_first = idx == 0
 
-        mask_value = -torch.finfo(scores.dtype).max
+            score = einsum('b h i d, b h j d -> b h i j', ql, qr) * self.scale
 
-        # causal masking
-        if self.causal and not has_cache:
-            i, j = scores.shape[-2:]
-            causal_mask = torch.ones((i, j), device = device, dtype = torch.bool).triu(1)
-            scores = scores.masked_fill(causal_mask, mask_value)
+            if exists(self.softclamp_value):
+                score = softclamp(score, self.softclamp_value)
 
-        # padding masking
-        if exists(mask):
-            scores = einx.where('b j, c b h i j, -> c b h i j', mask, scores, mask_value)
+            mask_value = -torch.finfo(score.dtype).max
+
+            # causal masking
+
+            if self.causal and not has_cache:
+                i, j = score.shape[-2:]
+                causal_mask = torch.ones((i, j), device = device, dtype = torch.bool).triu(1)
+                score = score.masked_fill(causal_mask, mask_value)
+
+            # context masking (key dimension)
+
+            if exists(context_mask):
+                score = einx.where('b j, b h i j, -> b h i j', context_mask, score, mask_value)
+
+            # base sequence masking (query dimension for step 0)
+
+            if is_first and exists(mask):
+                score = einx.where('b i, b h i j, -> b h i j', mask, score, mask_value)
+
+            scores.append(score)
 
         # aggregate from right to left
+
         out = vs_full[-1]
         current_scores_k = scores[-1]
 
@@ -230,7 +269,7 @@ class NPolyAttention(Module):
         new_cache_msgs = []
 
         for k in range(self.order - 1, 1, -1):
-            lse_k_step = torch.logsumexp(current_scores_k, dim = -1)
+            lse_k_step = current_scores_k.logsumexp(dim = -1)
             attn_k = current_scores_k.softmax(dim = -1)
 
             msg_step = einsum('b h i j, b h j d -> b h i d', attn_k, out)
@@ -249,7 +288,8 @@ class NPolyAttention(Module):
             current_scores_k = einx.add('b h j, b h i j -> b h i j', lse_k_full, scores[k - 1])
 
         # final step (k = 1)
-        lse_1_step = torch.logsumexp(current_scores_k, dim = -1)
+
+        lse_1_step = current_scores_k.logsumexp(dim = -1)
         attn_1 = current_scores_k.softmax(dim = -1)
 
         msg_1_step = einsum('b h i j, b h j d -> b h i d', attn_1, out)
@@ -267,11 +307,13 @@ class NPolyAttention(Module):
         scores12 = einx.add('b h j, b h i j -> b h i j', lse_1_full, scores[0])
 
         # final combine
+
         attn12 = scores12.softmax(dim = -1)
 
         out = einsum('b h i j, b h j d -> b h i d', attn12, msg_1_full)
 
         # elementwise multiply root values
+
         if self.multiply_root_value:
             if self.use_root_value_as_attn_gate:
                 root_value = root_value.sigmoid()
@@ -279,10 +321,12 @@ class NPolyAttention(Module):
             out = root_value * out
 
         # attention gate
+
         if self.attn_gate:
             out = out * gates.sigmoid()
 
         # combine heads
+
         out = self.to_out(self.merge_heads(out))
 
         if not return_cache:

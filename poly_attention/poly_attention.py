@@ -4,7 +4,7 @@ from __future__ import annotations
 from functools import partial
 
 import torch
-from torch import nn, einsum, stack, cat, Tensor
+from torch import nn, einsum, stack, cat, Tensor, is_tensor
 from torch.nn import Module, RMSNorm
 
 import einx
@@ -31,8 +31,11 @@ def exists(val):
 def default(val, d):
     return val if exists(val) else d
 
+def first(t):
+    return t[0]
+
 def cast_tuple(t, length = 1):
-    return t if isinstance(t, tuple) else ((t,) * length)
+    return (t,) * length if is_tensor(t) or not isinstance(t, tuple) else t
 
 def divisible_by(num, den):
     return (num % den) == 0
@@ -45,12 +48,15 @@ def softclamp(x, clamp_value):
 def reference_poly_attention(
     q1, q2_pass1, q2_pass2, q3, v3,
     mask = None,
+    context_mask = None,
     softclamp_value = None,
     causal = False,
     cache = None
 ):
     scale = q1.shape[-1] ** -0.5
     has_cache = exists(cache)
+
+    context_mask1, context_mask2 = context_mask if exists(context_mask) else (None, None)
 
     # pass 1 - q2 attends to q3
 
@@ -66,8 +72,8 @@ def reference_poly_attention(
         causal_mask = torch.ones((i, j), device = sim23.device, dtype = torch.bool).triu(1)
         sim23 = sim23.masked_fill(causal_mask, mask_value)
 
-    if exists(mask):
-        sim23 = einx.where('b j, b h i j, -> b h i j', mask, sim23, mask_value)
+    if exists(context_mask2):
+        sim23 = einx.where('b j, b h i j, -> b h i j', context_mask2, sim23, mask_value)
 
     # pass 1 attention and aggregation
 
@@ -92,8 +98,11 @@ def reference_poly_attention(
         causal_mask = torch.ones((i, j), device = sim12.device, dtype = torch.bool).triu(1)
         sim12 = sim12.masked_fill(causal_mask, mask_value)
 
+    if exists(context_mask1):
+        sim12 = einx.where('b j, b h i j, -> b h i j', context_mask1, sim12, mask_value)
+
     if exists(mask):
-        sim12 = einx.where('b j, b h i j, -> b h i j', mask, sim12, mask_value)
+        sim12 = einx.where('b i, b h i j, -> b h i j', mask, sim12, mask_value)
 
     # add logsumexp from pass 1 as bias to pass 2
 
@@ -199,6 +208,7 @@ class Order2PolyAttention(Module):
         x,
         context: Tensor | tuple[Tensor, ...] | None = None,
         mask = None,
+        context_mask: Tensor | tuple[Tensor | None, ...] | None = None,
         rotary_pos_emb = None,
         cache = None,
         return_cache = False
@@ -218,7 +228,7 @@ class Order2PolyAttention(Module):
         if self.attn_gate:
             q1, gates = q_and_maybe_gates
         else:
-            q1 = q_and_maybe_gates[0]
+            q1 = first(q_and_maybe_gates)
 
         # contexts
 
@@ -227,6 +237,17 @@ class Order2PolyAttention(Module):
         context = cast_tuple(context, 2)
         assert len(context) == 2
 
+        if self.multiply_root_value:
+            assert first(context).shape[-2] == seq_len, 'first context sequence length (context[0]) must match base sequence x when multiply_root_value is True'
+
+        if exists(context_mask):
+            context_mask = cast_tuple(context_mask, 2)
+            assert len(context_mask) == 2
+        elif not has_context and exists(mask):
+            context_mask = (mask, mask)
+        else:
+            context_mask = (None, None)
+
         if exists(self.context_norms):
             ctx1, ctx2 = (norm(c) for c, norm in zip(context, self.context_norms))
         else:
@@ -234,14 +255,14 @@ class Order2PolyAttention(Module):
 
         # kvs
 
-        kv1 = self.split_kv1(self.to_kvs[0](ctx1))
+        kv1 = self.split_kv1(first(self.to_kvs)(ctx1))
         kv2 = self.split_kv(self.to_kvs[1](ctx2))
 
         if self.shared_kv:
-            qs = (q1, kv1[0], kv2[0])
-            v2, v3 = kv1[0], kv2[0]
+            qs = (q1, first(kv1), first(kv2))
+            v2, v3 = first(kv1), first(kv2)
         else:
-            q2 = kv1[0]
+            q2 = first(kv1)
             v2 = kv1[1] if self.has_root_v else None
             q3, v3 = kv2
             qs = (q1, q2, q3)
@@ -273,24 +294,28 @@ class Order2PolyAttention(Module):
         else:
             q2_full, q3_full, v3_full = q2_cache, q3_cache, v3_cache
 
-        q_left = stack((q1, q2))
-        q_right = stack((q2_full, q3_full))
+        q2_left = q2
+        q2_right = q2_full
 
         # rotary within module
 
         if not exists(rotary_pos_emb) and exists(self.rotary_emb):
-            q_left, q_right = self.rotary_emb.rotate_queries_with_cached_keys(q_left, q_right)
-
-        q1, q2_left = q_left[0], q_left[1]
-        q2_right, q3 = q_right[0], q_right[1]
+            q1, q2_right = self.rotary_emb.rotate_queries_with_cached_keys(q1, q2_right)
+            q2_left, q3_full = self.rotary_emb.rotate_queries_with_cached_keys(q2_left, q3_full)
 
         # try to dispatch to fused kernel
+
+        has_context_mask = any(exists(m) for m in context_mask)
+
+        assert not (self.use_flash_kernel and has_context_mask), 'context_mask is not supported in flash poly attention'
 
         can_use_flash = (
             self.use_flash_kernel and
             exists(flash_poly_attention) and
             not has_cache and
             not return_cache and
+            not has_context_mask and
+            q1.shape[-2] == q2_right.shape[-2] == q3.shape[-2] and
             q1.is_cuda
         )
 
@@ -306,6 +331,7 @@ class Order2PolyAttention(Module):
             out, lse23_step, msg_step = reference_poly_attention(
                 q1, q2_left, q2_right, q3_full, v3_full,
                 mask = mask,
+                context_mask = context_mask,
                 softclamp_value = self.softclamp_value,
                 causal = self.causal,
                 cache = cache

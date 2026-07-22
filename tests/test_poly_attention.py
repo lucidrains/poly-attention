@@ -422,3 +422,167 @@ def test_poly_transformer(deep_cross_attention, causal):
 
     out = model(x, mask = mask)
     assert out.shape == (batch, seq_len, dim)
+
+def test_poly_attention_variable_context_lengths():
+    dim = 64
+    heads = 4
+    attn = PolyAttention(dim = dim, heads = heads)
+
+    x = torch.randn(2, 16, dim)
+    ctx1 = torch.randn(2, 20, dim)
+    ctx2 = torch.randn(2, 24, dim)
+
+    mask_x = torch.ones(2, 16, dtype = torch.bool)
+    mask_x[:, 12:] = False
+
+    mask_ctx1 = torch.ones(2, 20, dtype = torch.bool)
+    mask_ctx1[:, 15:] = False
+
+    mask_ctx2 = torch.ones(2, 24, dtype = torch.bool)
+    mask_ctx2[:, 18:] = False
+
+    out = attn(
+        x,
+        context = (ctx1, ctx2),
+        mask = mask_x,
+        context_mask = (mask_ctx1, mask_ctx2)
+    )
+
+    assert out.shape == (2, 16, dim)
+    assert not torch.isnan(out).any()
+
+@param('order', (2, 3, 4))
+def test_n_poly_attention_variable_context_lengths(order):
+    dim = 64
+    heads = 4
+    attn = NPolyAttention(dim = dim, order = order, heads = heads)
+
+    x = torch.randn(2, 16, dim)
+    contexts = tuple(torch.randn(2, 10 + 5 * i, dim) for i in range(order))
+    context_masks = tuple(
+        torch.ones(2, 10 + 5 * i, dtype = torch.bool) for i in range(order)
+    )
+    for i, cm in enumerate(context_masks):
+        cm[:, (10 + 5 * i) // 2:] = False
+
+    out = attn(
+        x,
+        context = contexts,
+        context_mask = context_masks
+    )
+
+    assert out.shape == (2, 16, dim)
+    assert not torch.isnan(out).any()
+
+def test_variable_context_equivalence_order2_and_n():
+    dim = 64
+    heads = 4
+
+    model_order2 = PolyAttention(dim = dim, heads = heads, use_flash_kernel = False)
+    model_n = NPolyAttention(dim = dim, order = 2, heads = heads)
+
+    state_dict = model_order2.state_dict()
+    model_n.load_state_dict(state_dict, strict = False)
+
+    x = torch.randn(2, 16, dim)
+    ctx1 = torch.randn(2, 20, dim)
+    ctx2 = torch.randn(2, 24, dim)
+
+    mask_x = torch.ones(2, 16, dtype = torch.bool)
+    mask_x[:, 12:] = False
+
+    mask_ctx1 = torch.ones(2, 20, dtype = torch.bool)
+    mask_ctx1[:, 15:] = False
+
+    mask_ctx2 = torch.ones(2, 24, dtype = torch.bool)
+    mask_ctx2[:, 18:] = False
+
+    out_order2 = model_order2(
+        x,
+        context = (ctx1, ctx2),
+        mask = mask_x,
+        context_mask = (mask_ctx1, mask_ctx2)
+    )
+
+    out_n = model_n(
+        x,
+        context = (ctx1, ctx2),
+        mask = mask_x,
+        context_mask = (mask_ctx1, mask_ctx2)
+    )
+
+    assert torch.allclose(out_order2, out_n, atol = 1e-5)
+
+def test_context_mask_correctness():
+    dim = 64
+    heads = 4
+
+    attn = PolyAttention(dim = dim, heads = heads, use_flash_kernel = False)
+
+    x = torch.randn(2, 16, dim)
+
+    ctx1_unpadded = torch.randn(2, 10, dim)
+    ctx2_unpadded = torch.randn(2, 12, dim)
+
+    ctx1_padded = torch.cat([ctx1_unpadded, torch.zeros(2, 10, dim)], dim = 1)
+    ctx2_padded = torch.cat([ctx2_unpadded, torch.zeros(2, 12, dim)], dim = 1)
+
+    mask_ctx1 = torch.zeros(2, 20, dtype = torch.bool)
+    mask_ctx1[:, :10] = True
+
+    mask_ctx2 = torch.zeros(2, 24, dtype = torch.bool)
+    mask_ctx2[:, :12] = True
+
+    out_unpadded = attn(x, context = (ctx1_unpadded, ctx2_unpadded))
+    out_padded = attn(x, context = (ctx1_padded, ctx2_padded), context_mask = (mask_ctx1, mask_ctx2))
+
+    assert torch.allclose(out_unpadded, out_padded, atol = 1e-5)
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = 'cuda required')
+def test_flash_poly_attention_context_mask_disallowed():
+    from poly_attention.flash_poly_attention import flash_poly_attention
+
+    q1 = torch.randn(2, 4, 16, 32)
+    q2 = torch.randn(2, 4, 16, 32)
+    q3 = torch.randn(2, 4, 16, 32)
+    v3 = torch.randn(2, 4, 16, 32)
+    context_mask = (torch.ones(2, 16, dtype = torch.bool), torch.ones(2, 16, dtype = torch.bool))
+
+    with pytest.raises(AssertionError, match = 'context_mask is not supported'):
+        flash_poly_attention(q1, q2, q3, v3, context_mask = context_mask)
+
+    attn = PolyAttention(dim = 64, heads = 4, use_flash_kernel = True)
+    x = torch.randn(2, 16, 64)
+
+    with pytest.raises(AssertionError, match = 'context_mask is not supported'):
+        attn(x, context_mask = context_mask)
+
+@param('order', (2, 3))
+@param('shared_kv', (False, True))
+def test_variable_context_shared_kv(order, shared_kv):
+    dim = 64
+    heads = 4
+
+    if order == 2:
+        attn = PolyAttention(dim = dim, heads = heads, shared_kv = shared_kv)
+    else:
+        attn = NPolyAttention(dim = dim, order = order, heads = heads, shared_kv = shared_kv)
+
+    x = torch.randn(2, 16, dim)
+    contexts = tuple(torch.randn(2, 10 + 5 * i, dim) for i in range(order))
+
+    out = attn(x, context = contexts)
+    assert out.shape == (2, 16, dim)
+    assert not torch.isnan(out).any()
+
+def test_multiply_root_value_context0_len_assertion():
+    attn = PolyAttention(dim = 64, heads = 4, multiply_root_value = True)
+
+    x = torch.randn(2, 16, 64)
+    ctx1 = torch.randn(2, 20, 64)
+    ctx2 = torch.randn(2, 24, 64)
+
+    with pytest.raises(AssertionError, match = 'first context sequence length'):
+        attn(x, context = (ctx1, ctx2))
+
+

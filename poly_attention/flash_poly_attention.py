@@ -4,6 +4,11 @@ import triton
 import triton.language as tl
 import triton.language.extra.cuda.libdevice as libdevice
 
+# helpers
+
+def exists(val):
+    return val is not None
+
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_stages=4, num_warps=4),
@@ -440,5 +445,12 @@ class PolyFlashAttention(torch.autograd.Function):
 
         return dq1, dq2, dq3, dv3, None, None, None
 
-def flash_poly_attention(q1, q2, q3, v3, mask=None, softclamp_value=None, is_causal=True):
+def flash_poly_attention(
+    q1, q2, q3, v3,
+    mask = None,
+    context_mask = None,
+    softclamp_value = None,
+    is_causal = True
+):
+    assert not exists(context_mask), 'context_mask is not supported in flash_poly_attention'
     return PolyFlashAttention.apply(q1, q2, q3, v3, mask, softclamp_value, is_causal)
