@@ -59,7 +59,7 @@ python train_function_composition.py --poly_layers=1 --base_layers=2
 
 - [@dillfrescott](https://github.com/dillfrescott) for submitting a stability fix
 
-- [@pranoyr](https://github.com/pranoyr) for more efficient caching of the GQA heads!
+- [@pranoyr](https://github.com/pranoyr) for adding key value caching for n-order poly attention as well as more efficient GQA caching for poly attention!
 
 ## Citations
 

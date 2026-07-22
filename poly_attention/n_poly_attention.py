@@ -126,7 +126,7 @@ class NPolyAttention(Module):
     ):
         device = x.device
         seq_len = x.shape[-2]
-        
+
         has_cache = exists(cache)
         if has_cache:
             assert seq_len == 1, 'sequence length must be 1 when using kv cache'
@@ -171,7 +171,7 @@ class NPolyAttention(Module):
 
         if exists(rotary_pos_emb):
             qs = tuple(apply_rotary_emb(rotary_pos_emb, q) for q in qs)
-            
+
         q1 = qs[0]
         qs_rest = qs[1:]
 
@@ -183,10 +183,10 @@ class NPolyAttention(Module):
             c_lses = (None,) * (self.order - 1)
             c_msgs = (None,) * (self.order - 1)
 
-        # Connect history 
+        # Connect history
         qs_rest_cache = tuple(safe_cat((cq, q), dim = -2) for cq, q in zip(c_qs, qs_rest))
         vs_cache = tuple(safe_cat((cv, v), dim = -2) for cv, v in zip(c_vs, vs_for_aggregation))
-    
+
         if self.is_gqa:
             match_kv = maybe(lambda t: repeat(t, 'b g n d -> b (g r) n d', r = self.num_rep))
             qs_rest_left = tuple(match_kv(t) for t in qs_rest)
@@ -206,7 +206,7 @@ class NPolyAttention(Module):
             q_left, q_right = self.rotary_emb.rotate_queries_with_cached_keys(q_left, q_right)
 
         scores = einsum('... i d, ... j d -> ... i j', q_left, q_right) * self.scale
-        
+
         if exists(self.softclamp_value):
             scores = softclamp(scores, self.softclamp_value)
 
@@ -227,18 +227,18 @@ class NPolyAttention(Module):
         current_scores_k = scores[-1]
 
         new_cache_lses = []
-        new_cache_msgs = [] 
+        new_cache_msgs = []
 
         for k in range(self.order - 1, 1, -1):
             lse_k_step = torch.logsumexp(current_scores_k, dim = -1)
             attn_k = current_scores_k.softmax(dim = -1)
 
             msg_step = einsum('b h i j, b h j d -> b h i d', attn_k, out)
-            
+
             idx = (self.order - 1) - k
             clse = c_lses[idx]
             cmsg = c_msgs[idx]
-            
+
             lse_k_full = safe_cat((clse, lse_k_step), dim = -1)
             msg_full = safe_cat((cmsg, msg_step), dim = -2)
 
@@ -253,11 +253,11 @@ class NPolyAttention(Module):
         attn_1 = current_scores_k.softmax(dim = -1)
 
         msg_1_step = einsum('b h i j, b h j d -> b h i d', attn_1, out)
-        
+
         idx = self.order - 2
         clse = c_lses[idx]
         cmsg = c_msgs[idx]
-        
+
         lse_1_full = safe_cat((clse, lse_1_step), dim = -1)
         msg_1_full = safe_cat((cmsg, msg_1_step), dim = -2)
 
@@ -284,13 +284,13 @@ class NPolyAttention(Module):
 
         # combine heads
         out = self.to_out(self.merge_heads(out))
-        
+
         if not return_cache:
             return out
-            
+
         new_c_lses = tuple(new_cache_lses)
         new_c_msgs = tuple(new_cache_msgs)
 
         new_cache = (qs_rest_cache, vs_cache, new_c_lses, new_c_msgs)
-        
+
         return out, new_cache
