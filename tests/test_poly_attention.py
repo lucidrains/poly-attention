@@ -137,6 +137,48 @@ def test_poly_attention_kv_cache_with_rotary():
     assert torch.allclose(out_parallel, out_stepwise, atol = 1e-5)
 
 @param('order', (2, 3, 4))
+@param('kv_heads', (2, 4))
+@param('shared_kv', (False, True))
+def test_n_poly_attention_kv_cache(order, kv_heads, shared_kv):
+    attn = NPolyAttention(dim = 128, order = order, heads = 4, kv_heads = kv_heads, dim_head = 32, causal = True, shared_kv = shared_kv)
+
+    x = torch.randn(2, 5, 128)
+
+    out_parallel = attn(x)
+
+    cache = None
+    out_stepwise = []
+
+    for i in range(5):
+        out, cache = attn(x[:, i:i+1], cache = cache, return_cache = True)
+        out_stepwise.append(out)
+
+    out_stepwise = torch.cat(out_stepwise, dim = -2)
+
+    assert torch.allclose(out_parallel, out_stepwise, atol = 1e-5)
+
+@param('order', (2, 3, 4))
+@param('kv_heads', (2, 4))
+@param('shared_kv', (False, True))
+def test_n_poly_attention_kv_cache_with_rotary(order, kv_heads, shared_kv):
+    attn = NPolyAttention(dim = 128, order = order, heads = 4, kv_heads = kv_heads, dim_head = 32, causal = True, shared_kv = shared_kv, use_rotary_embed = True)
+
+    x = torch.randn(2, 5, 128)
+
+    out_parallel = attn(x)
+
+    cache = None
+    out_stepwise = []
+
+    for i in range(5):
+        out, cache = attn(x[:, i:i+1], cache = cache, return_cache = True)
+        out_stepwise.append(out)
+
+    out_stepwise = torch.cat(out_stepwise, dim = -2)
+
+    assert torch.allclose(out_parallel, out_stepwise, atol = 1e-5)
+
+@param('order', (2, 3, 4))
 def test_prenorm(order):
     if order == 2:
         attn = PolyAttention(dim = 128, heads = 4, dim_head = 32, prenorm = True)
